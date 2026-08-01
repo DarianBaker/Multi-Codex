@@ -8,6 +8,7 @@
  *
  * Then add ONE line to ~/.codex/config.toml:
  *   openai_base_url = "http://localhost:PORT/backend-api/codex"
+ * Decision (MC-5): leave chatgpt_base_url at its default; local redirects break auxiliary services.
  *
  * Works with ChatGPT-account auth (cookies/tokens forwarded verbatim).
  */
@@ -20,6 +21,34 @@ const PORT = parseInt(process.argv[2] ?? "47839", 10);
 const UPSTREAM_HOST = "chatgpt.com";
 const UPSTREAM_BASE = "/backend-api";
 const authFile = process.env.MC2_AUTH_FILE;
+
+// Keep simple totals so the log shows how Codex uses each transport.
+const transportStats = {
+  preferred: undefined, // First transport Codex tries.
+  normalRequests: 0, // Regular HTTP requests.
+  streamingAttempts: 0, // WebSocket connection attempts.
+  fallbacks: 0, // Times Codex switches from WebSocket to HTTP.
+  streamingFailurePending: false, // Waiting to see if HTTP follows a failed WebSocket.
+};
+
+// Print all transport totals together after each relevant request.
+function logTransportStats() {
+  console.log(
+    `  transport: preferred=${transportStats.preferred ?? "unknown"}` +
+      ` streaming_attempts=${transportStats.streamingAttempts}` +
+      ` normal_requests=${transportStats.normalRequests}` +
+      ` fallbacks=${transportStats.fallbacks}`
+  );
+}
+
+// Show the quota details returned with each reply.
+function logUsage(headers) {
+  console.log(
+    `  usage: used_percentage=${headers["x-codex-primary-used-percent"] ?? "missing"}` +
+      ` window_minutes=${headers["x-codex-primary-window-minutes"] ?? "missing"}` +
+      ` reset_at=${headers["x-codex-primary-reset-at"] ?? "missing"}`
+  );
+}
 
 let replacementHeaders;
 if (authFile) {
@@ -51,6 +80,18 @@ function redactHeaders(headers) {
 
 const server = http.createServer((req, res) => {
   const upstreamPath = req.url; // already includes /backend-api/...
+
+  // A POST to /responses uses the normal HTTP transport.
+  if (req.method === "POST" && req.url?.split("?", 1)[0].endsWith("/responses")) {
+    transportStats.preferred ??= "HTTP";
+    transportStats.normalRequests += 1;
+    // HTTP immediately after a failed WebSocket is a fallback.
+    if (transportStats.streamingFailurePending) {
+      transportStats.fallbacks += 1;
+      transportStats.streamingFailurePending = false;
+    }
+    logTransportStats();
+  }
 
   console.log(`\n→ ${req.method} ${req.url}`);
   console.log("  headers:", JSON.stringify(redactHeaders(req.headers), null, 2));
@@ -94,6 +135,9 @@ const server = http.createServer((req, res) => {
 
     const upstreamReq = https.request(options, (upstreamRes) => {
       console.log(`← ${upstreamRes.statusCode} (${req.method} ${req.url})`);
+      if (req.method === "POST" && req.url?.split("?", 1)[0].endsWith("/responses")) {
+        logUsage(upstreamRes.headers);
+      }
 
       // Forward status and headers back to Codex
       const responseHeaders = { ...upstreamRes.headers };
@@ -119,6 +163,27 @@ const server = http.createServer((req, res) => {
     }
     upstreamReq.end();
   });
+});
+
+// WebSocket connection attempts arrive as HTTP upgrade requests.
+server.on("upgrade", (req, socket) => {
+  transportStats.preferred ??= "WebSocket";
+  transportStats.streamingAttempts += 1;
+  // The next normal request will confirm whether Codex fell back.
+  transportStats.streamingFailurePending = true;
+
+  console.log(`\n→ WebSocket ${req.method} ${req.url}`);
+  console.log("  headers:", JSON.stringify(redactHeaders(req.headers), null, 2));
+  logTransportStats();
+
+  // Record the attempt, then ask Codex to use HTTP instead.
+  socket.on("error", (err) => console.error(`  websocket error: ${err.message}`));
+  socket.end(
+    "HTTP/1.1 426 Upgrade Required\r\n" +
+      "Connection: close\r\n" +
+      "Content-Length: 0\r\n" +
+      "\r\n"
+  );
 });
 
 server.on("error", (err) => {
