@@ -3878,6 +3878,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-quota-proxy"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml 0.9.11+spec-1.1.0",
+]
+
+[[package]]
 name = "codex-response-debug-context"
 version = "0.0.0"
 dependencies = [
