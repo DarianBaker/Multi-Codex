@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use codex_login::token_data::parse_jwt_expiration;
@@ -21,17 +22,25 @@ async fn main() -> Result<()> {
         settings.validate()?;
         let report = settings.load_credentials().await;
 
-        for account in report.loaded {
+        for account in &report.loaded {
             println!("account '{}': {}", account.label, account.identifier);
         }
         for error in &report.errors {
             eprintln!("{error}");
         }
-        if !report.errors.is_empty() {
-            bail!("one or more accounts could not load credentials");
-        }
 
-        return serve(&settings.listen_addr, &settings.upstream_base).await;
+        // Never use the main account as an automatic fallback.
+        let account = report
+            .loaded
+            .into_iter()
+            .find(|account| {
+                settings
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.label == account.label && !profile.is_main)
+            })
+            .context("no usable secondary account; main account will not be used")?;
+        return serve(&settings.listen_addr, &settings.upstream_base, account).await;
     }
 
     // Show which build started before later proxy work adds long-running behavior.

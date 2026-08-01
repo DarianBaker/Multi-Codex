@@ -20,3 +20,6 @@ reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 toml = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

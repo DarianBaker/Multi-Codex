@@ -11,17 +11,34 @@ use axum::http::HeaderValue;
 use axum::http::Request;
 use axum::http::Response;
 use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
 use axum::http::header::HOST;
 use reqwest::Url;
+
+use crate::LoadedAccountCredentials;
+
+const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
+
+#[derive(Clone)]
+struct PayingAccount {
+    label: String,
+    access_token: String,
+    account_id: String,
+}
 
 #[derive(Clone)]
 struct ProxyState {
     client: reqwest::Client,
     upstream_base: Url,
+    paying_account: PayingAccount,
 }
 
 /// Starts the transparent HTTP proxy and serves requests until it is stopped.
-pub async fn serve(listen_addr: &str, upstream_base: &str) -> Result<()> {
+pub async fn serve(
+    listen_addr: &str,
+    upstream_base: &str,
+    account: LoadedAccountCredentials,
+) -> Result<()> {
     let listen_addr: SocketAddr = listen_addr
         .parse()
         .with_context(|| format!("listen_addr '{listen_addr}' is invalid"))?;
@@ -30,9 +47,22 @@ pub async fn serve(listen_addr: &str, upstream_base: &str) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("could not create upstream client")?;
+    let tokens = account
+        .credentials
+        .tokens
+        .context("chosen account has no login tokens")?;
+    let account_id = tokens
+        .account_id
+        .or(tokens.id_token.chatgpt_account_id)
+        .context("chosen account has no account identifier")?;
     let state = ProxyState {
         client,
         upstream_base,
+        paying_account: PayingAccount {
+            label: account.label,
+            access_token: tokens.access_token,
+            account_id,
+        },
     };
     let app = Router::new().fallback(forward).with_state(state);
     let listener = tokio::net::TcpListener::bind(listen_addr)
@@ -49,14 +79,14 @@ pub async fn serve(listen_addr: &str, upstream_base: &str) -> Result<()> {
 }
 
 async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+    eprintln!("request paid by account '{}'", state.paying_account.label);
     match forward_request(&state, request).await {
         Ok(response) => response,
         Err(error) => {
             eprintln!("forwarding failed: {error}");
-            Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("upstream request failed"))
-                .expect("static proxy error response must be valid")
+            let mut response = Response::new(Body::from("upstream request failed"));
+            *response.status_mut() = StatusCode::BAD_GATEWAY;
+            response
         }
     }
 }
@@ -69,6 +99,19 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
         .map_or("/", |value| value.as_str());
     let upstream_url = upstream_url(&state.upstream_base, request_target)?;
     let mut headers = end_to_end_headers(&parts.headers);
+    // Replace only the two headers that select the paying account.
+    headers.remove(AUTHORIZATION);
+    headers.remove(CHATGPT_ACCOUNT_ID);
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", state.paying_account.access_token))
+            .context("chosen account access token is invalid")?,
+    );
+    headers.insert(
+        CHATGPT_ACCOUNT_ID,
+        HeaderValue::from_str(&state.paying_account.account_id)
+            .context("chosen account identifier is invalid")?,
+    );
     headers.insert(HOST, upstream_host(&state.upstream_base)?);
 
     let upstream = state
@@ -131,3 +174,7 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "upgrade"
     )
 }
+
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod tests;
