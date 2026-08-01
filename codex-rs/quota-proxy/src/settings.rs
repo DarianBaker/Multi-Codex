@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -5,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use serde::Deserialize;
 
 /// Settings shared by every account in the pool.
@@ -55,5 +57,44 @@ impl PoolSettings {
         profile
             .switch_at_percent
             .unwrap_or(self.default_switch_at_percent)
+    }
+
+    /// Rejects settings that could select accounts unsafely.
+    pub fn validate(&self) -> Result<()> {
+        let mut priorities = HashMap::new();
+        for profile in &self.profiles {
+            if let Some(previous_label) = priorities.insert(profile.priority, &profile.label) {
+                bail!(
+                    "priority {} is shared by accounts '{}' and '{}'; give each account a unique priority number",
+                    profile.priority,
+                    previous_label,
+                    profile.label
+                );
+            }
+        }
+
+        if let Some(main) = self.profiles.iter().find(|profile| profile.is_main)
+            && self
+                .profiles
+                .iter()
+                .any(|profile| profile.priority > main.priority)
+        {
+            bail!(
+                "main account '{}' must have the highest priority number so it is used last; increase its priority",
+                main.label
+            );
+        }
+
+        for profile in &self.profiles {
+            if !profile.home.exists() {
+                bail!(
+                    "account '{}' folder '{}' does not exist; create it or fix home in the settings file",
+                    profile.label,
+                    profile.home.display()
+                );
+            }
+        }
+
+        Ok(())
     }
 }
