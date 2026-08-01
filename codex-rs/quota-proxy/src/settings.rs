@@ -12,9 +12,21 @@ use serde::Deserialize;
 /// Settings shared by every account in the pool.
 #[derive(Debug, Deserialize)]
 pub struct PoolSettings {
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_upstream_base")]
+    pub upstream_base: String,
     pub default_switch_at_percent: f64,
     #[serde(rename = "profile")]
     pub profiles: Vec<ProfileSettings>,
+}
+
+fn default_listen_addr() -> String {
+    "127.0.0.1:8788".to_string()
+}
+
+fn default_upstream_base() -> String {
+    "https://chatgpt.com/backend-api/codex".to_string()
 }
 
 /// Settings for one account.
