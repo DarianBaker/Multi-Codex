@@ -1,0 +1,59 @@
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use serde::Deserialize;
+
+/// Settings shared by every account in the pool.
+#[derive(Debug, Deserialize)]
+pub struct PoolSettings {
+    pub default_switch_at_percent: f64,
+    #[serde(rename = "profile")]
+    pub profiles: Vec<ProfileSettings>,
+}
+
+/// Settings for one account.
+#[derive(Debug, Deserialize)]
+pub struct ProfileSettings {
+    pub label: String,
+    pub home: PathBuf,
+    pub priority: u32,
+    pub switch_at_percent: Option<f64>,
+    #[serde(default)]
+    pub is_main: bool,
+}
+
+impl PoolSettings {
+    /// Loads a settings file and reports the line containing invalid TOML.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let input = fs::read_to_string(path)
+            .with_context(|| format!("could not read settings file {}", path.display()))?;
+        toml::from_str(&input).map_err(|source| {
+            let line = source
+                .span()
+                .map(|span| {
+                    input.as_bytes()[..span.start]
+                        .iter()
+                        .filter(|byte| **byte == b'\n')
+                        .count()
+                        + 1
+                })
+                .unwrap_or(1);
+            anyhow!(
+                "settings file {} is invalid at line {line}: {source}",
+                path.display()
+            )
+        })
+    }
+
+    /// Uses the account override when present, otherwise the global percentage.
+    pub fn switch_at_percent_for(&self, profile: &ProfileSettings) -> f64 {
+        profile
+            .switch_at_percent
+            .unwrap_or(self.default_switch_at_percent)
+    }
+}
