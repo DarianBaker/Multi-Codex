@@ -143,6 +143,9 @@ pub async fn serve(
     if let Some(warning) = loaded_usage.warning {
         eprintln!("{warning}");
     }
+    if let Err(error) = loaded_usage.store.set_paying_account(&account.label) {
+        eprintln!("could not save paying account: {error}");
+    }
     let usage_store = Arc::new(loaded_usage.store);
     let usage = usage_store.get(&account.label);
     let state = ProxyState {

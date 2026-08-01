@@ -3,9 +3,12 @@ use anyhow::Result;
 use anyhow::bail;
 use codex_login::token_data::parse_jwt_expiration;
 use codex_quota_proxy::PoolSettings;
+use codex_quota_proxy::pool_status;
 use codex_quota_proxy::serve;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,6 +19,12 @@ async fn main() -> Result<()> {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("usage: codex-quota-proxy check <settings-file>"))?;
             return check(path).await;
+        }
+        if first == "status" {
+            let path = args.next().ok_or_else(|| {
+                anyhow::anyhow!("usage: codex-quota-proxy status <settings-file>")
+            })?;
+            return status(path);
         }
 
         let path = first;
@@ -122,5 +131,21 @@ async fn check(path: OsString) -> Result<()> {
     if broken > 0 {
         bail!("{broken} account(s) are broken");
     }
+    Ok(())
+}
+
+fn status(path: OsString) -> Result<()> {
+    let settings = PoolSettings::load(&path)?;
+    let mut usage_path = PathBuf::from(path);
+    usage_path.set_extension("usage.json");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before the Unix epoch")?
+        .as_secs() as i64;
+    let status = pool_status(&settings, usage_path, now);
+    if let Some(warning) = status.warning {
+        eprintln!("{warning}");
+    }
+    print!("{}", status.output);
     Ok(())
 }

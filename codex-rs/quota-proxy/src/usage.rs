@@ -19,11 +19,14 @@ pub(super) struct AccountUsage {
 
 #[derive(Deserialize, Serialize)]
 struct UsageFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paying_account: Option<String>,
     accounts: HashMap<String, AccountUsage>,
 }
 
 pub(super) struct UsageStore {
     path: PathBuf,
+    paying_account: Mutex<Option<String>>,
     accounts: Mutex<HashMap<String, AccountUsage>>,
 }
 
@@ -36,24 +39,24 @@ impl UsageStore {
     pub(super) fn load(path: impl AsRef<Path>, now: i64) -> UsageLoad {
         let path = path.as_ref().to_path_buf();
         let mut warning = None;
-        let mut accounts = match fs::read(&path) {
+        let (paying_account, mut accounts) = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice::<UsageFile>(&bytes) {
-                Ok(file) => file.accounts,
+                Ok(file) => (file.paying_account, file.accounts),
                 Err(error) => {
                     warning = Some(format!(
                         "usage file {} is corrupt; ignoring saved usage: {error}",
                         path.display()
                     ));
-                    HashMap::new()
+                    (None, HashMap::new())
                 }
             },
-            Err(error) if error.kind() == ErrorKind::NotFound => HashMap::new(),
+            Err(error) if error.kind() == ErrorKind::NotFound => (None, HashMap::new()),
             Err(error) => {
                 warning = Some(format!(
                     "could not read usage file {}; ignoring saved usage: {error}",
                     path.display()
                 ));
-                HashMap::new()
+                (None, HashMap::new())
             }
         };
         let before_retain = accounts.len();
@@ -61,6 +64,7 @@ impl UsageStore {
         let expired_usage_removed = before_retain != accounts.len();
         let store = Self {
             path,
+            paying_account: Mutex::new(paying_account),
             accounts: Mutex::new(accounts),
         };
         if expired_usage_removed && let Err(error) = store.persist() {
@@ -85,12 +89,39 @@ impl UsageStore {
         self.persist()
     }
 
+    pub(super) fn set_paying_account(&self, label: &str) -> Result<()> {
+        *self
+            .paying_account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(label.to_string());
+        self.persist()
+    }
+
+    pub(super) fn snapshot(&self) -> (HashMap<String, AccountUsage>, Option<String>) {
+        let accounts = self
+            .accounts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let paying_account = self
+            .paying_account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (accounts, paying_account)
+    }
+
     fn persist(&self) -> Result<()> {
         let accounts = self
             .accounts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let bytes = serde_json::to_vec(&UsageFile {
+            paying_account: self
+                .paying_account
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             accounts: accounts.clone(),
         })
         .context("could not serialize usage figures")?;
