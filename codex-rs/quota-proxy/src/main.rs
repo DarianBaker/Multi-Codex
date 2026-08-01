@@ -1,9 +1,22 @@
 use anyhow::Result;
+use anyhow::bail;
 use codex_quota_proxy::PoolSettings;
 
 fn main() -> Result<()> {
     if let Some(path) = std::env::args_os().nth(1) {
-        PoolSettings::load(path)?.validate()?;
+        let settings = PoolSettings::load(path)?;
+        settings.validate()?;
+        let report = settings.load_credentials();
+
+        for account in report.loaded {
+            println!("account '{}': {}", account.label, account.identifier);
+        }
+        for error in &report.errors {
+            eprintln!("{error}");
+        }
+        if !report.errors.is_empty() {
+            bail!("one or more accounts could not load credentials");
+        }
     }
 
     // Show which build started before later proxy work adds long-running behavior.
