@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::fs;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,6 +15,7 @@ use axum::http::Response;
 use axum::routing::post;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
@@ -63,6 +65,7 @@ async fn forwarding_replaces_account_headers_without_changing_body() {
             access_token: "secondary-token".to_string(),
             account_id: "secondary-account".to_string(),
             usage: Arc::new(Mutex::new(None)),
+            usage_store: None,
         },
     };
     let body = br#"{"input":[{"role":"user","content":"keep this exactly"}]}"#;
@@ -103,6 +106,8 @@ async fn forwarding_replaces_account_headers_without_changing_body() {
 
 #[tokio::test]
 async fn forwarding_records_reply_usage_for_the_paying_account() {
+    let temp = tempfile::tempdir().expect("create temporary usage directory");
+    let usage_path = temp.path().join("pool.usage.json");
     let app = Router::new().route("/responses", post(reply_with_usage));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -114,7 +119,8 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
             .expect("serve test upstream");
     });
 
-    let state = test_state(upstream_addr);
+    let mut state = test_state(upstream_addr);
+    state.paying_account.usage_store = Some(Arc::new(UsageStore::load(&usage_path, 0).store));
     let request = Request::builder()
         .method("POST")
         .uri("/responses")
@@ -142,6 +148,21 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
                 resets_at: 1_704_069_000,
             }),
         )
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(usage_path).expect("read saved account usage"))
+            .expect("parse saved account usage");
+    assert_eq!(
+        persisted,
+        json!({
+            "accounts": {
+                "Pool B": {
+                    "used_percent": 12.5,
+                    "window_minutes": 300,
+                    "resets_at": 1_704_069_000,
+                }
+            }
+        })
     );
 }
 
@@ -342,6 +363,7 @@ fn test_state(upstream_addr: SocketAddr) -> ProxyState {
             access_token: "secondary-token".to_string(),
             account_id: "secondary-account".to_string(),
             usage: Arc::new(Mutex::new(None)),
+            usage_store: None,
         },
     }
 }

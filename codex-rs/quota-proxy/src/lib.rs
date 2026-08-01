@@ -1,9 +1,14 @@
 mod credentials;
 mod proxy;
 mod settings;
+mod usage;
 
 pub use credentials::CredentialLoadReport;
 pub use credentials::LoadedAccountCredentials;
 pub use proxy::serve;
 pub use settings::PoolSettings;
 pub use settings::ProfileSettings;
+
+#[cfg(test)]
+#[path = "usage_tests.rs"]
+mod usage_tests;

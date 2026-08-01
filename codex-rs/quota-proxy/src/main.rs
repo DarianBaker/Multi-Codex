@@ -5,6 +5,7 @@ use codex_login::token_data::parse_jwt_expiration;
 use codex_quota_proxy::PoolSettings;
 use codex_quota_proxy::serve;
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,7 +19,7 @@ async fn main() -> Result<()> {
         }
 
         let path = first;
-        let settings = PoolSettings::load(path)?;
+        let settings = PoolSettings::load(&path)?;
         settings.validate()?;
         let report = settings.load_credentials().await;
 
@@ -40,7 +41,15 @@ async fn main() -> Result<()> {
                     .any(|profile| profile.label == account.label && !profile.is_main)
             })
             .context("no usable secondary account; main account will not be used")?;
-        return serve(&settings.listen_addr, &settings.upstream_base, account).await;
+        let mut usage_path = PathBuf::from(path);
+        usage_path.set_extension("usage.json");
+        return serve(
+            &settings.listen_addr,
+            &settings.upstream_base,
+            account,
+            usage_path,
+        )
+        .await;
     }
 
     // Show which build started before later proxy work adds long-running behavior.

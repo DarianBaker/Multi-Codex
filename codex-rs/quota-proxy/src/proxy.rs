@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -20,19 +23,14 @@ use reqwest::Url;
 use serde::Deserialize;
 
 use crate::LoadedAccountCredentials;
+use crate::usage::AccountUsage;
+use crate::usage::UsageStore;
 
 const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
 const PRIMARY_RESET_AT: &str = "x-codex-primary-reset-at";
 const PRIMARY_USED_PERCENT: &str = "x-codex-primary-used-percent";
 const PRIMARY_WINDOW_MINUTES: &str = "x-codex-primary-window-minutes";
 const MAX_STREAMING_USAGE_EVENT_BYTES: usize = 64 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct AccountUsage {
-    used_percent: f64,
-    window_minutes: i64,
-    resets_at: i64,
-}
 
 #[derive(Deserialize)]
 struct StreamingUsageEvent {
@@ -59,7 +57,7 @@ struct StreamingUsageReader {
 }
 
 impl StreamingUsageReader {
-    fn read(&mut self, chunk: &[u8], known_usage: &Mutex<Option<AccountUsage>>) {
+    fn read(&mut self, chunk: &[u8], mut record: impl FnMut(AccountUsage)) {
         self.pending.extend_from_slice(chunk);
         loop {
             let lf_end = self
@@ -84,14 +82,11 @@ impl StreamingUsageReader {
                 && event.kind == "codex.rate_limits"
                 && let Some(primary) = event.rate_limits.and_then(|limits| limits.primary)
             {
-                store_usage(
-                    known_usage,
-                    AccountUsage {
-                        used_percent: primary.used_percent,
-                        window_minutes: primary.window_minutes,
-                        resets_at: primary.reset_at,
-                    },
-                );
+                record(AccountUsage {
+                    used_percent: primary.used_percent,
+                    window_minutes: primary.window_minutes,
+                    resets_at: primary.reset_at,
+                });
             }
             self.pending.drain(..event_end);
         }
@@ -107,6 +102,7 @@ struct PayingAccount {
     access_token: String,
     account_id: String,
     usage: Arc<Mutex<Option<AccountUsage>>>,
+    usage_store: Option<Arc<UsageStore>>,
 }
 
 #[derive(Clone)]
@@ -121,6 +117,7 @@ pub async fn serve(
     listen_addr: &str,
     upstream_base: &str,
     account: LoadedAccountCredentials,
+    usage_path: PathBuf,
 ) -> Result<()> {
     let listen_addr: SocketAddr = listen_addr
         .parse()
@@ -138,6 +135,16 @@ pub async fn serve(
         .account_id
         .or(tokens.id_token.chatgpt_account_id)
         .context("chosen account has no account identifier")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before the Unix epoch")?
+        .as_secs() as i64;
+    let loaded_usage = UsageStore::load(usage_path, now);
+    if let Some(warning) = loaded_usage.warning {
+        eprintln!("{warning}");
+    }
+    let usage_store = Arc::new(loaded_usage.store);
+    let usage = usage_store.get(&account.label);
     let state = ProxyState {
         client,
         upstream_base,
@@ -145,7 +152,8 @@ pub async fn serve(
             label: account.label,
             access_token: tokens.access_token,
             account_id,
-            usage: Arc::new(Mutex::new(None)),
+            usage: Arc::new(Mutex::new(usage)),
+            usage_store: Some(usage_store),
         },
     };
     let app = Router::new().fallback(forward).with_state(state);
@@ -212,9 +220,13 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
 
     // Keep the upstream body as a stream from socket to socket.
     let known_usage = Arc::clone(&state.paying_account.usage);
+    let usage_label = state.paying_account.label.clone();
+    let usage_store = state.paying_account.usage_store.clone();
     let mut streaming_usage = StreamingUsageReader::default();
     let body = upstream.bytes_stream().inspect_ok(move |chunk| {
-        streaming_usage.read(chunk, &known_usage);
+        streaming_usage.read(chunk, |usage| {
+            store_usage(&known_usage, &usage_label, usage_store.as_deref(), usage);
+        });
     });
     let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
@@ -226,14 +238,30 @@ fn record_reply_usage(account: &PayingAccount, headers: &HeaderMap) {
     let Some(usage) = reply_usage(headers) else {
         return;
     };
-    store_usage(&account.usage, usage);
+    store_usage(
+        &account.usage,
+        &account.label,
+        account.usage_store.as_deref(),
+        usage,
+    );
 }
 
-fn store_usage(known_usage: &Mutex<Option<AccountUsage>>, usage: AccountUsage) {
+fn store_usage(
+    known_usage: &Mutex<Option<AccountUsage>>,
+    label: &str,
+    usage_store: Option<&UsageStore>,
+    usage: AccountUsage,
+) {
     let mut known_usage = known_usage
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *known_usage = Some(usage);
+    drop(known_usage);
+    if let Some(usage_store) = usage_store
+        && let Err(error) = usage_store.record(label, usage)
+    {
+        eprintln!("could not save usage for account '{label}': {error}");
+    }
 }
 
 fn reply_usage(headers: &HeaderMap) -> Option<AccountUsage> {
