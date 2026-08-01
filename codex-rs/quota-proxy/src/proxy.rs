@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -18,12 +20,23 @@ use reqwest::Url;
 use crate::LoadedAccountCredentials;
 
 const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
+const PRIMARY_RESET_AT: &str = "x-codex-primary-reset-at";
+const PRIMARY_USED_PERCENT: &str = "x-codex-primary-used-percent";
+const PRIMARY_WINDOW_MINUTES: &str = "x-codex-primary-window-minutes";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AccountUsage {
+    used_percent: f64,
+    window_minutes: i64,
+    resets_at: i64,
+}
 
 #[derive(Clone)]
 struct PayingAccount {
     label: String,
     access_token: String,
     account_id: String,
+    usage: Arc<Mutex<Option<AccountUsage>>>,
 }
 
 #[derive(Clone)]
@@ -62,6 +75,7 @@ pub async fn serve(
             label: account.label,
             access_token: tokens.access_token,
             account_id,
+            usage: Arc::new(Mutex::new(None)),
         },
     };
     let app = Router::new().fallback(forward).with_state(state);
@@ -124,12 +138,42 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
         .context("upstream request failed")?;
     let status = upstream.status();
     let headers = end_to_end_headers(upstream.headers());
+    record_reply_usage(&state.paying_account, &headers);
 
     // Keep the upstream body as a stream from socket to socket.
     let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response)
+}
+
+fn record_reply_usage(account: &PayingAccount, headers: &HeaderMap) {
+    let Some(usage) = reply_usage(headers) else {
+        return;
+    };
+    let mut known_usage = account
+        .usage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *known_usage = Some(usage);
+}
+
+fn reply_usage(headers: &HeaderMap) -> Option<AccountUsage> {
+    Some(AccountUsage {
+        used_percent: headers
+            .get(PRIMARY_USED_PERCENT)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()?,
+        window_minutes: headers
+            .get(PRIMARY_WINDOW_MINUTES)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()?,
+        resets_at: headers.get(PRIMARY_RESET_AT)?.to_str().ok()?.parse().ok()?,
+    })
 }
 
 fn upstream_url(base: &Url, request_target: &str) -> Result<Url> {
