@@ -25,6 +25,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::ffi::OsString;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -42,6 +43,10 @@ const SYSTEM_PROXY_TEST_SUBPROCESS_ENV_VAR: &str = "CODEX_AUTH_SYSTEM_PROXY_TEST
 const SYSTEM_PROXY_TEST_PROXY_URL_ENV_VAR: &str = "CODEX_AUTH_SYSTEM_PROXY_TEST_PROXY_URL";
 const SYSTEM_PROXY_TEST_NAME: &str =
     "suite::auth_refresh::refresh_token_honors_respect_system_proxy";
+const CONCURRENT_REFRESH_SUBPROCESS_ENV_VAR: &str = "CODEX_AUTH_CONCURRENT_REFRESH_TEST_SUBPROCESS";
+const CONCURRENT_REFRESH_HOME_ENV_VAR: &str = "CODEX_AUTH_CONCURRENT_REFRESH_TEST_HOME";
+const CONCURRENT_REFRESH_TEST_NAME: &str =
+    "suite::auth_refresh::two_processes_do_not_refresh_the_same_login_at_once";
 const PROXY_ENV_KEYS: [&str; 8] = [
     "HTTP_PROXY",
     "http_proxy",
@@ -52,6 +57,139 @@ const PROXY_ENV_KEYS: [&str; 8] = [
     "NO_PROXY",
     "no_proxy",
 ];
+
+#[serial_test::serial(auth_env)]
+#[tokio::test]
+async fn two_processes_do_not_refresh_the_same_login_at_once() -> Result<()> {
+    if std::env::var_os(CONCURRENT_REFRESH_SUBPROCESS_ENV_VAR).is_some() {
+        let codex_home = PathBuf::from(
+            std::env::var_os(CONCURRENT_REFRESH_HOME_ENV_VAR)
+                .context("concurrent refresh home should be set")?,
+        );
+        let auth_manager = AuthManager::shared(
+            codex_home,
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*forced_chatgpt_workspace_id*/ None,
+            /*chatgpt_base_url*/ None,
+            AuthKeyringBackendKind::default(),
+            codex_login::AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
+                OutboundProxyPolicy::ReqwestDefault,
+            )),
+        )
+        .await;
+
+        auth_manager.refresh_token().await?;
+        auth_manager
+            .auth()
+            .await
+            .context("auth should still work")?;
+        return Ok(());
+    }
+
+    let codex_home = TempDir::new()?;
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN)),
+        last_refresh: Some(Utc::now() - Duration::days(1)),
+        agent_identity: None,
+        personal_access_token: None,
+        bedrock_api_key: None,
+    };
+    save_auth(
+        codex_home.path(),
+        &initial_auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let authority_address = listener.local_addr()?;
+    let authority = tiny_http::Server::from_listener(listener, None)
+        .map_err(|error| anyhow::anyhow!("failed to start token authority: {error}"))?;
+    let authority_thread = std::thread::spawn(move || {
+        let request = authority
+            .recv_timeout(StdDuration::from_secs(30))
+            .expect("authority should receive a refresh request")
+            .expect("authority should receive a request before timeout");
+        std::thread::sleep(StdDuration::from_millis(500));
+        let content_type = tiny_http::Header::from_bytes(
+            b"Content-Type".as_slice(),
+            b"application/json".as_slice(),
+        )
+        .expect("content type header should be valid");
+        request
+            .respond(
+                tiny_http::Response::from_string(
+                    r#"{"access_token":"new-access-token","refresh_token":"new-refresh-token"}"#,
+                )
+                .with_header(content_type),
+            )
+            .expect("authority should write refresh response");
+
+        match authority.recv_timeout(StdDuration::from_secs(1)) {
+            Ok(Some(request)) => {
+                request
+                    .respond(
+                        tiny_http::Response::from_string(
+                            r#"{"error":{"code":"refresh_token_reused"}}"#,
+                        )
+                        .with_status_code(400),
+                    )
+                    .expect("authority should reject a reused refresh token");
+                2
+            }
+            Ok(None) => 1,
+            Err(error) => panic!("authority failed while checking for a second request: {error}"),
+        }
+    });
+
+    let endpoint = format!("http://{authority_address}/oauth/token");
+    let spawn_child = || -> Result<std::process::Child> {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg("--exact")
+            .arg(CONCURRENT_REFRESH_TEST_NAME)
+            .env(CONCURRENT_REFRESH_SUBPROCESS_ENV_VAR, "1")
+            .env(CONCURRENT_REFRESH_HOME_ENV_VAR, codex_home.path())
+            .env(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, &endpoint)
+            .env(CLIENT_ID_OVERRIDE_ENV_VAR, "staging-client");
+        Ok(command.spawn()?)
+    };
+    let first = spawn_child()?;
+    let second = spawn_child()?;
+    let first_output = first.wait_with_output()?;
+    let second_output = second.wait_with_output()?;
+    let request_count = authority_thread
+        .join()
+        .expect("token authority thread should finish");
+
+    assert!(
+        first_output.status.success(),
+        "first refresh process failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        second_output.status.success(),
+        "second refresh process failed: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    assert_eq!(request_count, 1);
+    let stored = load_auth_dot_json(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )?
+    .context("renewed auth should remain readable")?;
+    let stored_tokens = stored
+        .tokens
+        .context("renewed tokens should remain readable")?;
+    assert_eq!(stored_tokens.access_token, "new-access-token");
+    assert_eq!(stored_tokens.refresh_token, "new-refresh-token");
+
+    Ok(())
+}
 
 #[serial_test::serial(auth_env)]
 #[tokio::test]

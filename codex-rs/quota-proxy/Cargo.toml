@@ -13,5 +13,8 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+codex-http-client = { workspace = true }
+codex-login = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml = { workspace = true }

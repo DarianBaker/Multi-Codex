@@ -6,6 +6,8 @@ use serde::Serialize;
 use serial_test::serial;
 use std::env;
 use std::fmt::Debug;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -194,6 +196,27 @@ pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OV
 pub const REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REVOKE_TOKEN_URL_OVERRIDE";
 pub const CLIENT_ID_OVERRIDE_ENV_VAR: &str = "CODEX_APP_SERVER_LOGIN_CLIENT_ID";
 static NEXT_DUMMY_AUTH_ID: AtomicU64 = AtomicU64::new(1);
+
+struct AuthRefreshFileLock {
+    _file: File,
+}
+
+impl AuthRefreshFileLock {
+    async fn acquire(codex_home: PathBuf) -> std::io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(codex_home.join("auth.json.lock"))?;
+            // File locks coordinate refreshes from separate Codex processes.
+            file.lock()?;
+            Ok(Self { _file: file })
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RefreshTokenError {
@@ -2376,6 +2399,13 @@ impl AuthManager {
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
+        let _file_guard = AuthRefreshFileLock::acquire(self.codex_home.clone())
+            .await
+            .map_err(RefreshTokenError::Transient)?;
+        self.refresh_token_after_locked_reload().await
+    }
+
+    async fn refresh_token_after_locked_reload(&self) -> Result<(), RefreshTokenError> {
         let auth_before_reload = self.auth_cached();
         if auth_before_reload
             .as_ref()
@@ -2415,7 +2445,14 @@ impl AuthManager {
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
-        self.refresh_token_from_authority_impl().await
+        if self.has_external_auth() {
+            self.refresh_token_from_authority_impl().await
+        } else {
+            let _file_guard = AuthRefreshFileLock::acquire(self.codex_home.clone())
+                .await
+                .map_err(RefreshTokenError::Transient)?;
+            self.refresh_token_after_locked_reload().await
+        }
     }
 
     async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
