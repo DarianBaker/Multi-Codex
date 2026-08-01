@@ -2,11 +2,12 @@ use anyhow::Result;
 use anyhow::bail;
 use codex_quota_proxy::PoolSettings;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     if let Some(path) = std::env::args_os().nth(1) {
         let settings = PoolSettings::load(path)?;
         settings.validate()?;
-        let report = settings.load_credentials();
+        let report = settings.load_credentials().await;
 
         for account in report.loaded {
             println!("account '{}': {}", account.label, account.identifier);

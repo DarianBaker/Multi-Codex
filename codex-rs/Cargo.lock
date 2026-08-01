@@ -3882,8 +3882,10 @@ name = "codex-quota-proxy"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "codex-http-client",
  "codex-login",
  "serde",
+ "tokio",
  "toml 0.9.11+spec-1.1.0",
 ]
 
