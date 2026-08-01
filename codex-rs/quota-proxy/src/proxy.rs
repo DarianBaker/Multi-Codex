@@ -15,7 +15,9 @@ use axum::http::Response;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::HOST;
+use futures::TryStreamExt;
 use reqwest::Url;
+use serde::Deserialize;
 
 use crate::LoadedAccountCredentials;
 
@@ -23,12 +25,80 @@ const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
 const PRIMARY_RESET_AT: &str = "x-codex-primary-reset-at";
 const PRIMARY_USED_PERCENT: &str = "x-codex-primary-used-percent";
 const PRIMARY_WINDOW_MINUTES: &str = "x-codex-primary-window-minutes";
+const MAX_STREAMING_USAGE_EVENT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct AccountUsage {
     used_percent: f64,
     window_minutes: i64,
     resets_at: i64,
+}
+
+#[derive(Deserialize)]
+struct StreamingUsageEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    rate_limits: Option<StreamingRateLimits>,
+}
+
+#[derive(Deserialize)]
+struct StreamingRateLimits {
+    primary: Option<StreamingUsageWindow>,
+}
+
+#[derive(Deserialize)]
+struct StreamingUsageWindow {
+    used_percent: f64,
+    window_minutes: i64,
+    reset_at: i64,
+}
+
+#[derive(Default)]
+struct StreamingUsageReader {
+    pending: Vec<u8>,
+}
+
+impl StreamingUsageReader {
+    fn read(&mut self, chunk: &[u8], known_usage: &Mutex<Option<AccountUsage>>) {
+        self.pending.extend_from_slice(chunk);
+        loop {
+            let lf_end = self
+                .pending
+                .windows(2)
+                .position(|window| window == b"\n\n")
+                .map(|position| position + 2);
+            let crlf_end = self
+                .pending
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4);
+            let Some(event_end) = lf_end.into_iter().chain(crlf_end).min() else {
+                break;
+            };
+            if event_end <= MAX_STREAMING_USAGE_EVENT_BYTES
+                && let Ok(event_text) = std::str::from_utf8(&self.pending[..event_end])
+                && let Some(data) = event_text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:"))
+                && let Ok(event) = serde_json::from_str::<StreamingUsageEvent>(data.trim_start())
+                && event.kind == "codex.rate_limits"
+                && let Some(primary) = event.rate_limits.and_then(|limits| limits.primary)
+            {
+                store_usage(
+                    known_usage,
+                    AccountUsage {
+                        used_percent: primary.used_percent,
+                        window_minutes: primary.window_minutes,
+                        resets_at: primary.reset_at,
+                    },
+                );
+            }
+            self.pending.drain(..event_end);
+        }
+        if self.pending.len() > MAX_STREAMING_USAGE_EVENT_BYTES {
+            self.pending.clear();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -141,7 +211,12 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     record_reply_usage(&state.paying_account, &headers);
 
     // Keep the upstream body as a stream from socket to socket.
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let known_usage = Arc::clone(&state.paying_account.usage);
+    let mut streaming_usage = StreamingUsageReader::default();
+    let body = upstream.bytes_stream().inspect_ok(move |chunk| {
+        streaming_usage.read(chunk, &known_usage);
+    });
+    let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response)
@@ -151,8 +226,11 @@ fn record_reply_usage(account: &PayingAccount, headers: &HeaderMap) {
     let Some(usage) = reply_usage(headers) else {
         return;
     };
-    let mut known_usage = account
-        .usage
+    store_usage(&account.usage, usage);
+}
+
+fn store_usage(known_usage: &Mutex<Option<AccountUsage>>, usage: AccountUsage) {
+    let mut known_usage = known_usage
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *known_usage = Some(usage);
