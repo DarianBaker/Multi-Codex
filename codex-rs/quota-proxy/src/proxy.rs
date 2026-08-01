@@ -51,6 +51,115 @@ struct StreamingUsageWindow {
     reset_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageRequestKind {
+    NewMessage,
+    FollowUp,
+}
+
+#[derive(Deserialize)]
+struct MessageRequest {
+    input: Vec<MessageRequestItem>,
+}
+
+#[derive(Deserialize)]
+struct MessageRequestItem {
+    #[serde(rename = "type")]
+    kind: String,
+    role: Option<String>,
+    internal_chat_message_metadata_passthrough: Option<MessageMetadata>,
+}
+
+#[derive(Deserialize)]
+struct MessageMetadata {
+    turn_id: Option<String>,
+}
+
+#[derive(Default)]
+struct MessageBoundaryDetector {
+    active_turn_id: Mutex<Option<String>>,
+}
+
+impl MessageBoundaryDetector {
+    fn classify(&self, body: &[u8]) -> Option<MessageRequestKind> {
+        let request = serde_json::from_slice::<MessageRequest>(body).ok()?;
+        let item = request.input.last()?;
+        let fallback = if item.role.as_deref() == Some("user") {
+            Some(MessageRequestKind::NewMessage)
+        } else if matches!(
+            item.kind.as_str(),
+            "function_call_output" | "custom_tool_call_output" | "tool_search_output"
+        ) {
+            Some(MessageRequestKind::FollowUp)
+        } else {
+            None
+        };
+        let Some(turn_id) = item
+            .internal_chat_message_metadata_passthrough
+            .as_ref()
+            .and_then(|metadata| metadata.turn_id.as_deref())
+            .filter(|turn_id| !turn_id.is_empty())
+        else {
+            return fallback;
+        };
+        let mut active_turn_id = self
+            .active_turn_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let kind = if fallback == Some(MessageRequestKind::FollowUp)
+            || active_turn_id.as_deref() == Some(turn_id)
+        {
+            MessageRequestKind::FollowUp
+        } else {
+            MessageRequestKind::NewMessage
+        };
+        *active_turn_id = Some(turn_id.to_string());
+        Some(kind)
+    }
+}
+
+struct StreamingMessageRequestReader {
+    detector: Arc<MessageBoundaryDetector>,
+    pending: Vec<u8>,
+    classified: bool,
+}
+
+impl StreamingMessageRequestReader {
+    fn new(detector: Arc<MessageBoundaryDetector>) -> Self {
+        Self {
+            detector,
+            pending: Vec::new(),
+            classified: false,
+        }
+    }
+
+    fn read(&mut self, chunk: &[u8]) {
+        if self.classified {
+            return;
+        }
+        self.pending.extend_from_slice(chunk);
+        if self
+            .pending
+            .iter()
+            .rfind(|byte| !byte.is_ascii_whitespace())
+            != Some(&b'}')
+        {
+            return;
+        }
+        let Some(kind) = self.detector.classify(&self.pending) else {
+            return;
+        };
+        self.classified = true;
+        self.pending.clear();
+        match kind {
+            MessageRequestKind::NewMessage => eprintln!("request starts a new message"),
+            MessageRequestKind::FollowUp => {
+                eprintln!("request continues the current message")
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct StreamingUsageReader {
     pending: Vec<u8>,
@@ -110,6 +219,7 @@ struct ProxyState {
     client: reqwest::Client,
     upstream_base: Url,
     paying_account: PayingAccount,
+    message_boundary: Arc<MessageBoundaryDetector>,
 }
 
 /// Starts the transparent HTTP proxy and serves requests until it is stopped.
@@ -158,6 +268,7 @@ pub async fn serve(
             usage: Arc::new(Mutex::new(usage)),
             usage_store: Some(usage_store),
         },
+        message_boundary: Arc::new(MessageBoundaryDetector::default()),
     };
     let app = Router::new().fallback(forward).with_state(state);
     let listener = tokio::net::TcpListener::bind(listen_addr)
@@ -209,11 +320,17 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     );
     headers.insert(HOST, upstream_host(&state.upstream_base)?);
 
+    let mut message_reader =
+        StreamingMessageRequestReader::new(Arc::clone(&state.message_boundary));
+    let body = body.into_data_stream().inspect_ok(move |chunk| {
+        message_reader.read(chunk);
+    });
+
     let upstream = state
         .client
         .request(parts.method, upstream_url)
         .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(reqwest::Body::wrap_stream(body))
         .send()
         .await
         .context("upstream request failed")?;
