@@ -4,6 +4,7 @@
  *
  * Usage:
  *   node scripts/local-proxy.mjs [PORT]
+ *   MC2_AUTH_FILE=/path/to/second/auth.json node scripts/local-proxy.mjs [PORT]
  *
  * Then add ONE line to ~/.codex/config.toml:
  *   openai_base_url = "http://localhost:PORT/backend-api/codex"
@@ -13,17 +14,37 @@
 
 import http from "node:http";
 import https from "node:https";
+import fs from "node:fs";
 
 const PORT = parseInt(process.argv[2] ?? "47839", 10);
 const UPSTREAM_HOST = "chatgpt.com";
 const UPSTREAM_BASE = "/backend-api";
+const authFile = process.env.MC2_AUTH_FILE;
+
+let replacementHeaders;
+if (authFile) {
+  const auth = JSON.parse(fs.readFileSync(authFile, "utf8"));
+  const accessToken = auth?.tokens?.access_token;
+  const accountId = auth?.tokens?.account_id;
+  if (typeof accessToken !== "string" || typeof accountId !== "string") {
+    throw new Error("MC2_AUTH_FILE must contain an access token and account ID");
+  }
+  replacementHeaders = {
+    authorization: `Bearer ${accessToken}`,
+    "chatgpt-account-id": accountId,
+  };
+}
 
 function redactHeaders(headers) {
   const sensitive = new Set(["authorization", "cookie", "set-cookie"]);
   return Object.fromEntries(
     Object.entries(headers).map(([k, v]) => [
       k,
-      sensitive.has(k.toLowerCase()) ? "[redacted]" : v,
+      k.toLowerCase() === "authorization" && v?.startsWith("Bearer ")
+        ? "Bearer [redacted]"
+        : sensitive.has(k.toLowerCase())
+          ? "[redacted]"
+          : v,
     ])
   );
 }
@@ -48,8 +69,12 @@ const server = http.createServer((req, res) => {
 
     const upstreamHeaders = {
       ...req.headers,
+      ...replacementHeaders,
       host: UPSTREAM_HOST,
     };
+    if (replacementHeaders) {
+      console.log("  replaced authorization and chatgpt-account-id before forwarding");
+    }
     // Strip hop-by-hop headers that must not be forwarded
     delete upstreamHeaders["transfer-encoding"];
     delete upstreamHeaders["connection"];
