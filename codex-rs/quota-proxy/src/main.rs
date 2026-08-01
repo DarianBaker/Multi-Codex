@@ -2,6 +2,7 @@ use anyhow::Result;
 use anyhow::bail;
 use codex_login::token_data::parse_jwt_expiration;
 use codex_quota_proxy::PoolSettings;
+use codex_quota_proxy::serve;
 use std::ffi::OsString;
 
 #[tokio::main]
@@ -29,6 +30,8 @@ async fn main() -> Result<()> {
         if !report.errors.is_empty() {
             bail!("one or more accounts could not load credentials");
         }
+
+        return serve(&settings.listen_addr, &settings.upstream_base).await;
     }
 
     // Show which build started before later proxy work adds long-running behavior.
