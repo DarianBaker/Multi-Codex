@@ -27,6 +27,7 @@ use crate::usage::AccountUsage;
 use crate::usage::UsageStore;
 
 const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
+const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const PRIMARY_RESET_AT: &str = "x-codex-primary-reset-at";
 const PRIMARY_USED_PERCENT: &str = "x-codex-primary-used-percent";
 const PRIMARY_WINDOW_MINUTES: &str = "x-codex-primary-window-minutes";
@@ -57,105 +58,15 @@ enum MessageRequestKind {
     FollowUp,
 }
 
-#[derive(Deserialize)]
-struct MessageRequest {
-    input: Vec<MessageRequestItem>,
-}
-
-#[derive(Deserialize)]
-struct MessageRequestItem {
-    #[serde(rename = "type")]
-    kind: String,
-    role: Option<String>,
-    internal_chat_message_metadata_passthrough: Option<MessageMetadata>,
-}
-
-#[derive(Deserialize)]
-struct MessageMetadata {
-    turn_id: Option<String>,
-}
-
 #[derive(Default)]
-struct MessageBoundaryDetector {
-    active_turn_id: Mutex<Option<String>>,
-}
+struct MessageBoundaryDetector;
 
 impl MessageBoundaryDetector {
-    fn classify(&self, body: &[u8]) -> Option<MessageRequestKind> {
-        let request = serde_json::from_slice::<MessageRequest>(body).ok()?;
-        let item = request.input.last()?;
-        let fallback = if item.role.as_deref() == Some("user") {
-            Some(MessageRequestKind::NewMessage)
-        } else if matches!(
-            item.kind.as_str(),
-            "function_call_output" | "custom_tool_call_output" | "tool_search_output"
-        ) {
-            Some(MessageRequestKind::FollowUp)
-        } else {
-            None
-        };
-        let Some(turn_id) = item
-            .internal_chat_message_metadata_passthrough
-            .as_ref()
-            .and_then(|metadata| metadata.turn_id.as_deref())
-            .filter(|turn_id| !turn_id.is_empty())
-        else {
-            return fallback;
-        };
-        let mut active_turn_id = self
-            .active_turn_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let kind = if fallback == Some(MessageRequestKind::FollowUp)
-            || active_turn_id.as_deref() == Some(turn_id)
-        {
+    fn classify(&self, headers: &HeaderMap) -> MessageRequestKind {
+        if headers.contains_key(X_CODEX_TURN_STATE) {
             MessageRequestKind::FollowUp
         } else {
             MessageRequestKind::NewMessage
-        };
-        *active_turn_id = Some(turn_id.to_string());
-        Some(kind)
-    }
-}
-
-struct StreamingMessageRequestReader {
-    detector: Arc<MessageBoundaryDetector>,
-    pending: Vec<u8>,
-    classified: bool,
-}
-
-impl StreamingMessageRequestReader {
-    fn new(detector: Arc<MessageBoundaryDetector>) -> Self {
-        Self {
-            detector,
-            pending: Vec::new(),
-            classified: false,
-        }
-    }
-
-    fn read(&mut self, chunk: &[u8]) {
-        if self.classified {
-            return;
-        }
-        self.pending.extend_from_slice(chunk);
-        if self
-            .pending
-            .iter()
-            .rfind(|byte| !byte.is_ascii_whitespace())
-            != Some(&b'}')
-        {
-            return;
-        }
-        let Some(kind) = self.detector.classify(&self.pending) else {
-            return;
-        };
-        self.classified = true;
-        self.pending.clear();
-        match kind {
-            MessageRequestKind::NewMessage => eprintln!("request starts a new message"),
-            MessageRequestKind::FollowUp => {
-                eprintln!("request continues the current message")
-            }
         }
     }
 }
@@ -214,12 +125,35 @@ struct PayingAccount {
     usage_store: Option<Arc<UsageStore>>,
 }
 
+#[derive(Default)]
+struct MessageAccountPin {
+    pinned: Mutex<Option<PayingAccount>>,
+}
+
+impl MessageAccountPin {
+    fn account_for_request(
+        &self,
+        kind: MessageRequestKind,
+        supplied: PayingAccount,
+    ) -> PayingAccount {
+        let mut pinned = self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kind == MessageRequestKind::NewMessage {
+            *pinned = None;
+        }
+        pinned.get_or_insert(supplied).clone()
+    }
+}
+
 #[derive(Clone)]
 struct ProxyState {
     client: reqwest::Client,
     upstream_base: Url,
     paying_account: PayingAccount,
     message_boundary: Arc<MessageBoundaryDetector>,
+    account_pin: Arc<MessageAccountPin>,
 }
 
 /// Starts the transparent HTTP proxy and serves requests until it is stopped.
@@ -268,7 +202,8 @@ pub async fn serve(
             usage: Arc::new(Mutex::new(usage)),
             usage_store: Some(usage_store),
         },
-        message_boundary: Arc::new(MessageBoundaryDetector::default()),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
     };
     let app = Router::new().fallback(forward).with_state(state);
     let listener = tokio::net::TcpListener::bind(listen_addr)
@@ -285,7 +220,6 @@ pub async fn serve(
 }
 
 async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
-    eprintln!("request paid by account '{}'", state.paying_account.label);
     match forward_request(&state, request).await {
         Ok(response) => response,
         Err(error) => {
@@ -299,6 +233,15 @@ async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Res
 
 async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<Response<Body>> {
     let (parts, body) = request.into_parts();
+    let kind = state.message_boundary.classify(&parts.headers);
+    match kind {
+        MessageRequestKind::NewMessage => eprintln!("request starts a new message"),
+        MessageRequestKind::FollowUp => eprintln!("request continues the current message"),
+    }
+    let paying_account = state
+        .account_pin
+        .account_for_request(kind, state.paying_account.clone());
+    eprintln!("request paid by account '{}'", paying_account.label);
     let request_target = parts
         .uri
         .path_and_query()
@@ -310,38 +253,32 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     headers.remove(CHATGPT_ACCOUNT_ID);
     headers.insert(
         AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", state.paying_account.access_token))
+        HeaderValue::from_str(&format!("Bearer {}", paying_account.access_token))
             .context("chosen account access token is invalid")?,
     );
     headers.insert(
         CHATGPT_ACCOUNT_ID,
-        HeaderValue::from_str(&state.paying_account.account_id)
+        HeaderValue::from_str(&paying_account.account_id)
             .context("chosen account identifier is invalid")?,
     );
     headers.insert(HOST, upstream_host(&state.upstream_base)?);
-
-    let mut message_reader =
-        StreamingMessageRequestReader::new(Arc::clone(&state.message_boundary));
-    let body = body.into_data_stream().inspect_ok(move |chunk| {
-        message_reader.read(chunk);
-    });
 
     let upstream = state
         .client
         .request(parts.method, upstream_url)
         .headers(headers)
-        .body(reqwest::Body::wrap_stream(body))
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
         .send()
         .await
         .context("upstream request failed")?;
     let status = upstream.status();
     let headers = end_to_end_headers(upstream.headers());
-    record_reply_usage(&state.paying_account, &headers);
+    record_reply_usage(&paying_account, &headers);
 
     // Keep the upstream body as a stream from socket to socket.
-    let known_usage = Arc::clone(&state.paying_account.usage);
-    let usage_label = state.paying_account.label.clone();
-    let usage_store = state.paying_account.usage_store.clone();
+    let known_usage = Arc::clone(&paying_account.usage);
+    let usage_label = paying_account.label.clone();
+    let usage_store = paying_account.usage_store.clone();
     let mut streaming_usage = StreamingUsageReader::default();
     let body = upstream.bytes_stream().inspect_ok(move |chunk| {
         streaming_usage.read(chunk, |usage| {

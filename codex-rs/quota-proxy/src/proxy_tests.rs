@@ -67,7 +67,8 @@ async fn forwarding_replaces_account_headers_without_changing_body() {
             usage: Arc::new(Mutex::new(None)),
             usage_store: None,
         },
-        message_boundary: Arc::new(MessageBoundaryDetector::default()),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
     };
     let body = br#"{"input":[{"role":"user","content":"keep this exactly"}]}"#;
     let request = Request::builder()
@@ -306,71 +307,86 @@ async fn forwarding_reads_midstream_usage_without_delaying_or_altering_reply() {
 
 #[test]
 fn message_with_several_tool_steps_keeps_one_boundary_for_normal_and_streaming_requests() {
-    let detector = MessageBoundaryDetector::default();
+    let detector = MessageBoundaryDetector;
+    let mut follow_up_headers = HeaderMap::new();
+    follow_up_headers.insert("x-codex-turn-state", HeaderValue::from_static("same-turn"));
     let requests = [
-        json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": "start",
-                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
-            }],
-            "stream": false
-        }),
-        json!({
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "call-1",
-                "output": "first",
-                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
-            }],
-            "stream": false
-        }),
-        json!({
-            "input": [{
-                "type": "custom_tool_call_output",
-                "call_id": "call-2",
-                "output": "second",
-                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
-            }],
-            "stream": true
-        }),
-        json!({
-            "input": [{
-                "type": "tool_search_output",
-                "call_id": "call-3",
-                "status": "completed",
-                "tools": [],
-                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
-            }],
-            "stream": true
-        }),
-        json!({
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": "next",
-                "internal_chat_message_metadata_passthrough": {"turn_id": "turn-2"}
-            }],
-            "stream": true
-        }),
+        (
+            HeaderMap::new(),
+            json!({
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": "start"
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            follow_up_headers.clone(),
+            json!({
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "first"
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            follow_up_headers.clone(),
+            json!({
+                "input": [{
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-2",
+                    "output": "second"
+                }],
+                "stream": true
+            }),
+        ),
+        (
+            follow_up_headers,
+            json!({
+                "input": [{
+                    "type": "tool_search_output",
+                    "call_id": "call-3",
+                    "status": "completed",
+                    "tools": []
+                }],
+                "stream": true
+            }),
+        ),
+        (
+            HeaderMap::new(),
+            json!({
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": "next"
+                }],
+                "stream": true
+            }),
+        ),
     ];
 
     let actual = requests
         .iter()
-        .map(|request| {
-            detector.classify(&serde_json::to_vec(request).expect("serialize request fixture"))
+        .map(|(headers, body)| {
+            (
+                detector.classify(headers),
+                body["stream"].as_bool().expect("request stream flag"),
+            )
         })
         .collect::<Vec<_>>();
 
     assert_eq!(
         actual,
         vec![
-            Some(MessageRequestKind::NewMessage),
-            Some(MessageRequestKind::FollowUp),
-            Some(MessageRequestKind::FollowUp),
-            Some(MessageRequestKind::FollowUp),
-            Some(MessageRequestKind::NewMessage),
+            (MessageRequestKind::NewMessage, false),
+            (MessageRequestKind::FollowUp, false),
+            (MessageRequestKind::FollowUp, true),
+            (MessageRequestKind::FollowUp, true),
+            (MessageRequestKind::NewMessage, true),
         ]
     );
 }
@@ -437,7 +453,8 @@ fn test_state(upstream_addr: SocketAddr) -> ProxyState {
             usage: Arc::new(Mutex::new(None)),
             usage_store: None,
         },
-        message_boundary: Arc::new(MessageBoundaryDetector::default()),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
     }
 }
 
