@@ -25,6 +25,7 @@ use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::HOST;
+use axum::http::header::SEC_WEBSOCKET_EXTENSIONS;
 use axum::response::IntoResponse;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -43,9 +44,9 @@ use crate::PoolSettings;
 use crate::usage::AccountUsage;
 use crate::usage::UsageStore;
 use crate::websocket_turn::WebsocketTurnTracker;
+use crate::websocket_turn::X_CODEX_TURN_STATE;
 
 const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
-const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const PRIMARY_RESET_AT: &str = "x-codex-primary-reset-at";
 const PRIMARY_USED_PERCENT: &str = "x-codex-primary-used-percent";
 const PRIMARY_WINDOW_MINUTES: &str = "x-codex-primary-window-minutes";
@@ -552,6 +553,9 @@ async fn connect_upstream_websocket(
         .into_client_request()
         .context("could not build upstream websocket request")?;
     for (name, value) in headers {
+        if name == SEC_WEBSOCKET_EXTENSIONS {
+            continue;
+        }
         upstream_request
             .headers_mut()
             .insert(name.clone(), value.clone());
@@ -584,7 +588,7 @@ async fn relay_websocket(
     headers: HeaderMap,
     mut paying_account: PayingAccount,
 ) {
-    let mut turn_tracker = WebsocketTurnTracker::default();
+    let turn_tracker = WebsocketTurnTracker;
     loop {
         tokio::select! {
             message = downstream.next() => {
