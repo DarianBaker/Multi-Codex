@@ -3883,6 +3883,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "codex-backend-openapi-models",
  "codex-http-client",
  "codex-login",
  "codex-utils-rustls-provider",

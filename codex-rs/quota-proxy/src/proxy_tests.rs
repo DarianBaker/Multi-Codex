@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fs;
 use std::sync::Arc;
@@ -12,7 +13,12 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::Request;
 use axum::http::Response;
+use axum::routing::get;
 use axum::routing::post;
+use codex_backend_openapi_models::models::PlanType;
+use codex_backend_openapi_models::models::RateLimitStatusDetails;
+use codex_backend_openapi_models::models::RateLimitStatusPayload;
+use codex_backend_openapi_models::models::RateLimitWindowSnapshot;
 use futures::SinkExt;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
@@ -997,4 +1003,560 @@ async fn capture_request(
         body,
     });
     Response::new(Body::from("ok"))
+}
+
+fn usage_payload_body(used_percent: i32, reset_at: i32) -> Vec<u8> {
+    serde_json::to_vec(&RateLimitStatusPayload {
+        plan_type: PlanType::Plus,
+        rate_limit: Some(Some(Box::new(RateLimitStatusDetails {
+            allowed: used_percent < 100,
+            limit_reached: used_percent >= 100,
+            primary_window: Some(Some(Box::new(RateLimitWindowSnapshot {
+                used_percent,
+                limit_window_seconds: 18_000,
+                reset_after_seconds: 0,
+                reset_at,
+            }))),
+            secondary_window: None,
+        }))),
+        credits: None,
+        spend_control: None,
+        additional_rate_limits: None,
+        rate_limit_reached_type: None,
+    })
+    .expect("serialize fixture usage payload")
+}
+
+async fn usage_by_bearer_token(
+    State(bodies): State<Arc<HashMap<String, Vec<u8>>>>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let auth = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match bodies.get(auth) {
+        Some(body) => Response::new(Body::from(body.clone())),
+        None => {
+            let mut response = Response::new(Body::from("no fixture for this account"));
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            response
+        }
+    }
+}
+
+type DynamicUsageBodies = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+async fn usage_by_bearer_token_mutable(
+    State(bodies): State<DynamicUsageBodies>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let auth = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    match bodies
+        .lock()
+        .expect("lock dynamic usage fixtures")
+        .get(auth)
+    {
+        Some(body) => Response::new(Body::from(body.clone())),
+        None => {
+            let mut response = Response::new(Body::from("no fixture for this account"));
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            response
+        }
+    }
+}
+
+fn two_account_state(upstream_addr: SocketAddr, usage_store: Arc<UsageStore>) -> ProxyState {
+    ProxyState {
+        client: reqwest::Client::new(),
+        upstream_base: Url::parse(&format!("http://{upstream_addr}"))
+            .expect("parse test upstream URL"),
+        account_selector: Arc::new(AccountSelector::new(vec![
+            AccountCandidate {
+                account: PayingAccount {
+                    label: "Pool A".to_string(),
+                    access_token: "token-a".to_string(),
+                    account_id: "account-a".to_string(),
+                    usage: Arc::new(Mutex::new(None)),
+                    usage_store: Some(Arc::clone(&usage_store)),
+                    set_aside: Arc::new(Mutex::new(None)),
+                },
+                priority: 1,
+                switch_at_percent: 80.0,
+                is_main: false,
+            },
+            AccountCandidate {
+                account: PayingAccount {
+                    label: "Pool B".to_string(),
+                    access_token: "token-b".to_string(),
+                    account_id: "account-b".to_string(),
+                    usage: Arc::new(Mutex::new(None)),
+                    usage_store: Some(Arc::clone(&usage_store)),
+                    set_aside: Arc::new(Mutex::new(None)),
+                },
+                priority: 2,
+                switch_at_percent: 80.0,
+                is_main: false,
+            },
+        ])),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
+    }
+}
+
+fn n_account_state(
+    upstream_addr: SocketAddr,
+    usage_store: Arc<UsageStore>,
+    count: u32,
+) -> ProxyState {
+    let accounts = (0..count)
+        .map(|index| AccountCandidate {
+            account: PayingAccount {
+                label: format!("Pool {index}"),
+                access_token: format!("token-{index}"),
+                account_id: format!("account-{index}"),
+                usage: Arc::new(Mutex::new(None)),
+                usage_store: Some(Arc::clone(&usage_store)),
+                set_aside: Arc::new(Mutex::new(None)),
+            },
+            priority: index + 1,
+            switch_at_percent: 80.0,
+            is_main: false,
+        })
+        .collect();
+    ProxyState {
+        client: reqwest::Client::new(),
+        upstream_base: Url::parse(&format!("http://{upstream_addr}"))
+            .expect("parse test upstream URL"),
+        account_selector: Arc::new(AccountSelector::new(accounts)),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
+    }
+}
+
+async fn usage_barrier_or_slow(
+    State((barrier, fast_body)): State<(Arc<tokio::sync::Barrier>, Vec<u8>)>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let auth = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if auth == "Bearer token-4" {
+        // Simulates one unreachable/very slow account: far longer than any
+        // reasonable per-account timeout, and never touches the barrier.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        return Response::new(Body::from("too slow"));
+    }
+    // Every other account only responds once ALL of them have arrived here at
+    // once — impossible unless the proxy issued their requests concurrently.
+    barrier.wait().await;
+    Response::new(Body::from(fast_body))
+}
+
+#[tokio::test]
+async fn usage_refresh_fetches_every_account_concurrently_and_ignores_the_slow_one() {
+    const ACCOUNT_COUNT: u32 = 5;
+    const FAST_ACCOUNTS: usize = 4; // all accounts except the deliberately slow "Pool 4"
+
+    let fast_body = usage_payload_body(15, 1_700_000_300);
+    let barrier = Arc::new(tokio::sync::Barrier::new(FAST_ACCOUNTS));
+    let app = Router::new()
+        .route("/api/codex/usage", get(usage_barrier_or_slow))
+        .with_state((Arc::clone(&barrier), fast_body));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test upstream");
+    let upstream_addr = listener.local_addr().expect("read test upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve test upstream");
+    });
+
+    let temp = tempfile::tempdir().expect("create temporary usage directory");
+    let usage_path = temp.path().join("pool.usage.json");
+    let usage_store = Arc::new(UsageStore::load(&usage_path, 0).store);
+    let state = n_account_state(upstream_addr, usage_store, ACCOUNT_COUNT);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/codex/usage")
+        .body(Body::empty())
+        .expect("build usage refresh request");
+
+    let response = timeout(
+        Duration::from_secs(3),
+        answer_usage_refresh(&state, request),
+    )
+    .await
+    .expect("usage refresh for 5 accounts (one unreachable) completes within 3 seconds");
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read usage refresh body");
+    let payload: RateLimitStatusPayload =
+        serde_json::from_slice(&body).expect("usage refresh body parses as RateLimitStatusPayload");
+
+    let additional = payload
+        .additional_rate_limits
+        .flatten()
+        .expect("additional_rate_limits present");
+    assert_eq!(additional.len(), ACCOUNT_COUNT as usize + 1); // + the pool total row
+
+    for label in ["Pool 0", "Pool 1", "Pool 2", "Pool 3"] {
+        // Whichever account defaults to "paying" (no prior refresh set one) gets a
+        // " (paying)" suffix on its label; match by prefix rather than exact label.
+        let entry = additional
+            .iter()
+            .find(|entry| entry.limit_name.starts_with(label))
+            .unwrap_or_else(|| panic!("row for {label} present"));
+        let primary = entry
+            .rate_limit
+            .clone()
+            .flatten()
+            .and_then(|details| details.primary_window.flatten())
+            .unwrap_or_else(|| panic!("{label} reported real usage, not just cached/unavailable"));
+        assert_eq!(primary.used_percent, 15);
+    }
+
+    let slow_entry = additional
+        .iter()
+        .find(|entry| entry.limit_name == "Pool 4")
+        .expect("row for the slow account is still present");
+    let slow_has_primary_window = slow_entry
+        .rate_limit
+        .clone()
+        .flatten()
+        .and_then(|details| details.primary_window.flatten())
+        .is_some();
+    assert!(
+        !slow_has_primary_window,
+        "the unreachable account must degrade to unavailable, not block or fabricate data"
+    );
+}
+
+#[tokio::test]
+async fn main_accounts_row_sorts_first_regardless_of_its_label() {
+    let bodies = Arc::new(HashMap::from([
+        (
+            "Bearer token-main".to_string(),
+            usage_payload_body(30, 1_700_000_300),
+        ),
+        (
+            "Bearer token-other".to_string(),
+            usage_payload_body(10, 1_700_000_600),
+        ),
+    ]));
+    let app = Router::new()
+        .route("/api/codex/usage", get(usage_by_bearer_token))
+        .with_state(Arc::clone(&bodies));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test upstream");
+    let upstream_addr = listener.local_addr().expect("read test upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve test upstream");
+    });
+
+    let temp = tempfile::tempdir().expect("create temporary usage directory");
+    let usage_path = temp.path().join("pool.usage.json");
+    let usage_store = Arc::new(UsageStore::load(&usage_path, 0).store);
+    let state = ProxyState {
+        client: reqwest::Client::new(),
+        upstream_base: Url::parse(&format!("http://{upstream_addr}"))
+            .expect("parse test upstream URL"),
+        account_selector: Arc::new(AccountSelector::new(vec![
+            AccountCandidate {
+                account: PayingAccount {
+                    // Deliberately alphabetically-last label, to prove ordering
+                    // comes from `is_main`, not from the label text.
+                    label: "Zzz Main".to_string(),
+                    access_token: "token-main".to_string(),
+                    account_id: "account-main".to_string(),
+                    usage: Arc::new(Mutex::new(None)),
+                    usage_store: Some(Arc::clone(&usage_store)),
+                    set_aside: Arc::new(Mutex::new(None)),
+                },
+                priority: 2,
+                switch_at_percent: 80.0,
+                is_main: true,
+            },
+            AccountCandidate {
+                account: PayingAccount {
+                    label: "Aaa Other".to_string(),
+                    access_token: "token-other".to_string(),
+                    account_id: "account-other".to_string(),
+                    usage: Arc::new(Mutex::new(None)),
+                    usage_store: Some(Arc::clone(&usage_store)),
+                    set_aside: Arc::new(Mutex::new(None)),
+                },
+                priority: 1,
+                switch_at_percent: 80.0,
+                is_main: false,
+            },
+        ])),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
+    };
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/codex/usage")
+        .body(Body::empty())
+        .expect("build usage refresh request");
+
+    let response = answer_usage_refresh(&state, request).await;
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read usage refresh body");
+    let payload: RateLimitStatusPayload =
+        serde_json::from_slice(&body).expect("usage refresh body parses as RateLimitStatusPayload");
+
+    let additional = payload
+        .additional_rate_limits
+        .flatten()
+        .expect("additional_rate_limits present");
+    let main_entry = additional
+        .iter()
+        .find(|entry| entry.limit_name.starts_with("Zzz Main"))
+        .expect("main account row present");
+    let other_entry = additional
+        .iter()
+        .find(|entry| entry.limit_name.starts_with("Aaa Other"))
+        .expect("other account row present");
+
+    // This is the exact property the real Codex TUI relies on: it renders
+    // families in `limit_id` (here: `metered_feature`) order via a BTreeMap.
+    assert!(
+        main_entry.metered_feature < other_entry.metered_feature,
+        "main account's limit_id ({}) must sort before the other account's ({}) despite its label sorting last",
+        main_entry.metered_feature,
+        other_entry.metered_feature
+    );
+}
+
+#[tokio::test]
+async fn is_usage_refresh_request_matches_the_usage_get_regardless_of_prefix() {
+    assert!(is_usage_refresh_request(
+        &Method::GET,
+        "/backend-api/codex/api/codex/usage"
+    ));
+    assert!(is_usage_refresh_request(&Method::GET, "/wham/usage"));
+    assert!(!is_usage_refresh_request(&Method::POST, "/api/codex/usage"));
+    assert!(!is_usage_refresh_request(&Method::GET, "/responses"));
+}
+
+#[tokio::test]
+async fn usage_refresh_reports_one_row_per_account_and_marks_the_payer() {
+    let bodies = Arc::new(HashMap::from([
+        (
+            "Bearer token-a".to_string(),
+            usage_payload_body(42, 1_700_000_300),
+        ),
+        (
+            "Bearer token-b".to_string(),
+            usage_payload_body(10, 1_700_000_600),
+        ),
+    ]));
+    let app = Router::new()
+        .route("/api/codex/usage", get(usage_by_bearer_token))
+        .with_state(Arc::clone(&bodies));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test upstream");
+    let upstream_addr = listener.local_addr().expect("read test upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve test upstream");
+    });
+
+    let temp = tempfile::tempdir().expect("create temporary usage directory");
+    let usage_path = temp.path().join("pool.usage.json");
+    let usage_store = Arc::new(UsageStore::load(&usage_path, 0).store);
+    usage_store
+        .set_paying_account("Pool A")
+        .expect("mark Pool A as paying");
+    let state = two_account_state(upstream_addr, usage_store);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/codex/usage")
+        .body(Body::empty())
+        .expect("build usage refresh request");
+
+    let response = answer_usage_refresh(&state, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read usage refresh body");
+    let payload: RateLimitStatusPayload =
+        serde_json::from_slice(&body).expect("usage refresh body parses as RateLimitStatusPayload");
+
+    let additional = payload
+        .additional_rate_limits
+        .flatten()
+        .expect("additional_rate_limits present");
+    let names: Vec<&str> = additional
+        .iter()
+        .map(|entry| entry.limit_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Pool A (paying)", "Pool B", "Pool total"]);
+
+    // The main/"codex" family (today's default, unlabeled row) reflects the paying account.
+    let codex_primary = payload
+        .rate_limit
+        .flatten()
+        .expect("top-level codex family present")
+        .primary_window
+        .flatten()
+        .expect("codex family has a primary window");
+    assert_eq!(codex_primary.used_percent, 42);
+}
+
+#[tokio::test]
+async fn usage_refresh_includes_a_pool_total_that_averages_known_accounts() {
+    let bodies = Arc::new(HashMap::from([
+        (
+            "Bearer token-a".to_string(),
+            usage_payload_body(40, 1_700_000_300),
+        ),
+        (
+            "Bearer token-b".to_string(),
+            usage_payload_body(20, 1_700_000_100),
+        ),
+    ]));
+    let app = Router::new()
+        .route("/api/codex/usage", get(usage_by_bearer_token))
+        .with_state(Arc::clone(&bodies));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test upstream");
+    let upstream_addr = listener.local_addr().expect("read test upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve test upstream");
+    });
+
+    let temp = tempfile::tempdir().expect("create temporary usage directory");
+    let usage_path = temp.path().join("pool.usage.json");
+    let usage_store = Arc::new(UsageStore::load(&usage_path, 0).store);
+    let state = two_account_state(upstream_addr, usage_store);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/codex/usage")
+        .body(Body::empty())
+        .expect("build usage refresh request");
+
+    let response = answer_usage_refresh(&state, request).await;
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read usage refresh body");
+    let payload: RateLimitStatusPayload =
+        serde_json::from_slice(&body).expect("usage refresh body parses as RateLimitStatusPayload");
+
+    let additional = payload
+        .additional_rate_limits
+        .flatten()
+        .expect("additional_rate_limits present");
+    let total_entry = additional
+        .iter()
+        .find(|entry| entry.limit_name == "Pool total")
+        .expect("a pool total entry is present alongside the per-account rows");
+    let total_primary = total_entry
+        .rate_limit
+        .clone()
+        .flatten()
+        .expect("total row has rate limit details")
+        .primary_window
+        .flatten()
+        .expect("total row has a primary window");
+    assert_eq!(total_primary.used_percent, 30);
+    assert_eq!(total_primary.reset_at, 1_700_000_100);
+}
+
+#[tokio::test]
+async fn pool_total_updates_as_an_account_is_spent_and_then_refills() {
+    let bodies = Arc::new(Mutex::new(HashMap::from([
+        (
+            "Bearer token-a".to_string(),
+            usage_payload_body(20, 1_700_000_300),
+        ),
+        (
+            "Bearer token-b".to_string(),
+            usage_payload_body(20, 1_700_000_600),
+        ),
+    ])));
+    let app = Router::new()
+        .route("/api/codex/usage", get(usage_by_bearer_token_mutable))
+        .with_state(Arc::clone(&bodies));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test upstream");
+    let upstream_addr = listener.local_addr().expect("read test upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve test upstream");
+    });
+
+    let temp = tempfile::tempdir().expect("create temporary usage directory");
+    let usage_path = temp.path().join("pool.usage.json");
+    let usage_store = Arc::new(UsageStore::load(&usage_path, 0).store);
+    let state = two_account_state(upstream_addr, usage_store);
+
+    let refresh_total_used_percent = |state: ProxyState| async move {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/codex/usage")
+            .body(Body::empty())
+            .expect("build usage refresh request");
+        let response = answer_usage_refresh(&state, request).await;
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read usage refresh body");
+        let payload: RateLimitStatusPayload = serde_json::from_slice(&body)
+            .expect("usage refresh body parses as RateLimitStatusPayload");
+        payload
+            .additional_rate_limits
+            .flatten()
+            .expect("additional_rate_limits present")
+            .iter()
+            .find(|entry| entry.limit_name == "Pool total")
+            .expect("a pool total entry is present")
+            .rate_limit
+            .clone()
+            .flatten()
+            .expect("total row has rate limit details")
+            .primary_window
+            .flatten()
+            .expect("total row has a primary window")
+            .used_percent
+    };
+
+    let before_spend = refresh_total_used_percent(state.clone()).await;
+    assert_eq!(before_spend, 20);
+
+    // Pool A gets spent up.
+    bodies.lock().expect("lock dynamic usage fixtures").insert(
+        "Bearer token-a".to_string(),
+        usage_payload_body(80, 1_700_000_300),
+    );
+    let after_spend = refresh_total_used_percent(state.clone()).await;
+    assert_eq!(after_spend, 50);
+
+    // Pool A refills back down.
+    bodies.lock().expect("lock dynamic usage fixtures").insert(
+        "Bearer token-a".to_string(),
+        usage_payload_body(0, 1_700_000_900),
+    );
+    let after_refill = refresh_total_used_percent(state.clone()).await;
+    assert_eq!(after_refill, 10);
 }

@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 axum = { workspace = true, features = ["http1", "tokio", "ws"] }
+codex-backend-openapi-models = { path = "../codex-backend-openapi-models" }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }

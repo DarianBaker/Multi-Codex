@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -40,10 +41,16 @@ use tokio_tungstenite::tungstenite::Message as UpstreamWebSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as UpstreamCloseFrame;
 
+use axum::http::Method;
+use axum::http::header::CONTENT_TYPE;
+use codex_backend_openapi_models::models::PlanType;
+
 use crate::LoadedAccountCredentials;
 use crate::PoolSettings;
 use crate::usage::AccountUsage;
 use crate::usage::UsageStore;
+use crate::usage_wire;
+use crate::usage_wire::AccountUsageRow;
 use crate::websocket_turn::WebsocketTurnTracker;
 use crate::websocket_turn::X_CODEX_TURN_STATE;
 
@@ -487,7 +494,23 @@ pub async fn serve(
         .context("proxy stopped unexpectedly")
 }
 
+fn is_usage_refresh_request(method: &Method, path: &str) -> bool {
+    *method == Method::GET && (path.ends_with("/api/codex/usage") || path.ends_with("/wham/usage"))
+}
+
+fn account_auth_headers(account: &PayingAccount) -> Result<(HeaderValue, HeaderValue)> {
+    Ok((
+        HeaderValue::from_str(&format!("Bearer {}", account.access_token))
+            .context("chosen account access token is invalid")?,
+        HeaderValue::from_str(&account.account_id)
+            .context("chosen account identifier is invalid")?,
+    ))
+}
+
 async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+    if is_usage_refresh_request(request.method(), request.uri().path()) {
+        return answer_usage_refresh(&state, request).await;
+    }
     if request
         .headers()
         .get("upgrade")
@@ -522,6 +545,144 @@ async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Res
             response
         }
     }
+}
+
+/// A single account's usage fetch may never hold up the response past this long;
+/// an account that times out degrades to "unavailable" instead of blocking the rest.
+const ACCOUNT_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+type AccountUsageFetchHandle = tokio::task::JoinHandle<Option<(PlanType, AccountUsage)>>;
+
+/// Answers a `GET /api/codex/usage` (or `/wham/usage`) request with a synthesized
+/// payload covering every configured account, instead of forwarding it to whichever
+/// account is currently pinned. Every account is fetched concurrently, each bounded
+/// by `ACCOUNT_USAGE_FETCH_TIMEOUT`; an account whose fetch fails or times out falls
+/// back to its last known cached usage rather than failing or delaying the response.
+async fn answer_usage_refresh(state: &ProxyState, request: Request<Body>) -> Response<Body> {
+    let request_target = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |value| value.as_str())
+        .to_string();
+    let now = unix_now().unwrap_or(0);
+
+    let paying_label = state
+        .account_selector
+        .accounts
+        .iter()
+        .find_map(|candidate| candidate.account.usage_store.as_ref())
+        .and_then(|store| store.snapshot().1)
+        .or_else(|| {
+            state
+                .account_selector
+                .accounts
+                .first()
+                .map(|candidate| candidate.account.label.clone())
+        });
+
+    let handles: Vec<(PayingAccount, bool, AccountUsageFetchHandle)> = state
+        .account_selector
+        .accounts
+        .iter()
+        .map(|candidate| {
+            let account = candidate.account.clone();
+            let fetch_account = account.clone();
+            let client = state.client.clone();
+            let upstream_base = state.upstream_base.clone();
+            let request_target = request_target.clone();
+            let handle = tokio::spawn(async move {
+                tokio::time::timeout(
+                    ACCOUNT_USAGE_FETCH_TIMEOUT,
+                    fetch_account_usage(&client, &upstream_base, &request_target, &fetch_account),
+                )
+                .await
+                .ok()
+                .flatten()
+            });
+            (account, candidate.is_main, handle)
+        })
+        .collect();
+
+    let mut plan_type = None;
+    let mut rows = Vec::with_capacity(handles.len());
+    for (account, is_main, handle) in handles {
+        let usage = match handle.await.ok().flatten() {
+            Some((fetched_plan_type, usage)) => {
+                if plan_type.is_none() {
+                    plan_type = Some(fetched_plan_type);
+                }
+                *account
+                    .usage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(usage);
+                if let Some(store) = &account.usage_store
+                    && let Err(error) = store.record(&account.label, usage)
+                {
+                    eprintln!(
+                        "could not save refreshed usage for account '{}': {error}",
+                        account.label
+                    );
+                }
+                Some(usage)
+            }
+            None => *account
+                .usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        };
+        rows.push(AccountUsageRow {
+            label: account.label.clone(),
+            limit_id: usage_wire::account_limit_id(&account.label, is_main),
+            usage,
+            is_paying: paying_label.as_deref() == Some(account.label.as_str()),
+        });
+    }
+
+    // `serve()` refuses to start with zero configured accounts, so there is always
+    // at least one row to treat as the top-level "codex" family.
+    let paying_index = rows.iter().position(|row| row.is_paying).unwrap_or(0);
+    let paying_row = AccountUsageRow {
+        label: rows[paying_index].label.clone(),
+        limit_id: rows[paying_index].limit_id.clone(),
+        usage: rows[paying_index].usage,
+        is_paying: rows[paying_index].is_paying,
+    };
+    rows.push(usage_wire::pool_total_row(&rows));
+    let body = usage_wire::synthesize_usage_response(
+        plan_type.unwrap_or_default(),
+        &paying_row,
+        &rows,
+        now,
+    );
+
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
+async fn fetch_account_usage(
+    client: &reqwest::Client,
+    upstream_base: &Url,
+    request_target: &str,
+    account: &PayingAccount,
+) -> Option<(PlanType, AccountUsage)> {
+    let url = upstream_url(upstream_base, request_target).ok()?;
+    let (auth_header, account_id_header) = account_auth_headers(account).ok()?;
+    let response = client
+        .get(url)
+        .header(AUTHORIZATION, auth_header)
+        .header(CHATGPT_ACCOUNT_ID, account_id_header)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.bytes().await.ok()?;
+    usage_wire::parse_primary_usage(&body)
 }
 
 async fn forward_websocket(
@@ -742,16 +903,9 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     // Replace only the two headers that select the paying account.
     headers.remove(AUTHORIZATION);
     headers.remove(CHATGPT_ACCOUNT_ID);
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", paying_account.access_token))
-            .context("chosen account access token is invalid")?,
-    );
-    headers.insert(
-        CHATGPT_ACCOUNT_ID,
-        HeaderValue::from_str(&paying_account.account_id)
-            .context("chosen account identifier is invalid")?,
-    );
+    let (auth_header, account_id_header) = account_auth_headers(&paying_account)?;
+    headers.insert(AUTHORIZATION, auth_header);
+    headers.insert(CHATGPT_ACCOUNT_ID, account_id_header);
     headers.insert(HOST, upstream_host(&state.upstream_base)?);
 
     let upstream = state

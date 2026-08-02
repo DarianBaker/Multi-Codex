@@ -3,6 +3,7 @@ mod proxy;
 mod settings;
 mod status;
 mod usage;
+mod usage_wire;
 mod websocket_turn;
 
 pub use credentials::CredentialLoadReport;
