@@ -206,6 +206,7 @@ struct AccountCandidate {
     account: PayingAccount,
     priority: u32,
     switch_at_percent: f64,
+    is_main: bool,
 }
 
 struct AccountSelector {
@@ -224,7 +225,13 @@ impl AccountSelector {
     }
 
     fn select_at(&self, now: i64) -> Result<PayingAccount> {
+        let mut main: Option<&AccountCandidate> = None;
+        let mut all_secondary_accounts_set_aside = true;
         for candidate in &self.accounts {
+            if candidate.is_main {
+                main = Some(candidate);
+                continue;
+            }
             let set_aside = *candidate
                 .account
                 .set_aside
@@ -241,6 +248,7 @@ impl AccountSelector {
                 );
                 continue;
             }
+            all_secondary_accounts_set_aside = false;
             if set_aside.is_some() {
                 *candidate
                     .account
@@ -296,6 +304,52 @@ impl AccountSelector {
                     return Ok(candidate.account.clone());
                 }
             }
+        }
+        if all_secondary_accounts_set_aside && let Some(candidate) = main {
+            let set_aside = *candidate
+                .account
+                .set_aside
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(set_aside) = set_aside
+                && set_aside.returns_at > now
+            {
+                eprintln!(
+                    "skipping set-aside account '{}': {}; returns at {} (Unix seconds)",
+                    candidate.account.label,
+                    set_aside.reason.description(),
+                    set_aside.returns_at
+                );
+                return Err(anyhow!(
+                    "no account has room below its switch-over percentage"
+                ));
+            }
+            if set_aside.is_some() {
+                *candidate
+                    .account
+                    .set_aside
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+            let mut known_usage = candidate
+                .account
+                .usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if known_usage.is_some_and(|usage| usage.resets_at <= now) {
+                *known_usage = None;
+            }
+            drop(known_usage);
+            eprintln!(
+                "pool exhausted; main account '{}' is now paying",
+                candidate.account.label
+            );
+            if let Some(store) = &candidate.account.usage_store
+                && let Err(error) = store.set_paying_account(&candidate.account.label)
+            {
+                eprintln!("could not save paying account: {error}");
+            }
+            return Ok(candidate.account.clone());
         }
         Err(anyhow!(
             "no account has room below its switch-over percentage"
@@ -369,9 +423,6 @@ pub async fn serve(
             .iter()
             .find(|profile| profile.label == account.label)
             .with_context(|| format!("loaded account '{}' is missing settings", account.label))?;
-        if profile.is_main {
-            continue;
-        }
         let tokens = account
             .credentials
             .tokens
@@ -392,12 +443,11 @@ pub async fn serve(
             },
             priority: profile.priority,
             switch_at_percent: settings.switch_at_percent_for(profile),
+            is_main: profile.is_main,
         });
     }
     if candidates.is_empty() {
-        return Err(anyhow!(
-            "no usable secondary account; main account will not be used"
-        ));
+        return Err(anyhow!("no usable account"));
     }
     let state = ProxyState {
         client,
