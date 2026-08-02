@@ -316,6 +316,192 @@ async fn forwarding_reads_midstream_usage_without_delaying_or_altering_reply() {
     );
 }
 
+#[tokio::test]
+async fn mid_answer_limit_explains_retry_and_retry_uses_next_account_without_changing_history() {
+    let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let app = Router::new().route(
+        "/responses",
+        post({
+            let captured = Arc::clone(&captured);
+            move |request: Request<Body>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = to_bytes(body, usize::MAX)
+                        .await
+                        .expect("read forwarded body")
+                        .to_vec();
+                    let mut captured = captured.lock().expect("lock captured requests");
+                    captured.push(CapturedRequest {
+                        headers: parts.headers,
+                        body,
+                    });
+                    if captured.len() == 2 {
+                        let mut response = Response::new(Body::from(
+                            r#"{"error":{"type":"usage_limit_reached","message":"upstream limit","resets_at":4102444800}}"#,
+                        ));
+                        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                        response
+                    } else {
+                        Response::new(Body::from(if captured.len() == 1 {
+                            "tool requested"
+                        } else {
+                            "retry succeeded"
+                        }))
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test upstream");
+    let upstream_addr = listener.local_addr().expect("read test upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve test upstream");
+    });
+
+    let first = PayingAccount {
+        label: "Pool B".to_string(),
+        access_token: "first-token".to_string(),
+        account_id: "first-account".to_string(),
+        usage: Arc::new(Mutex::new(None)),
+        usage_store: None,
+        set_aside: Arc::new(Mutex::new(None)),
+    };
+    let second = PayingAccount {
+        label: "Pool C".to_string(),
+        access_token: "second-token".to_string(),
+        account_id: "second-account".to_string(),
+        usage: Arc::new(Mutex::new(None)),
+        usage_store: None,
+        set_aside: Arc::new(Mutex::new(None)),
+    };
+    let state = ProxyState {
+        client: reqwest::Client::new(),
+        upstream_base: Url::parse(&format!("http://{upstream_addr}"))
+            .expect("parse test upstream URL"),
+        account_selector: Arc::new(AccountSelector::new(vec![
+            AccountCandidate {
+                account: first.clone(),
+                priority: 1,
+                switch_at_percent: 80.0,
+                is_main: false,
+            },
+            AccountCandidate {
+                account: second,
+                priority: 2,
+                switch_at_percent: 80.0,
+                is_main: false,
+            },
+        ])),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
+    };
+    let message = br#"{"input":[{"role":"user","content":"keep history exactly"}]}"#;
+    let tool_output =
+        br#"{"input":[{"type":"function_call_output","call_id":"call-1","output":"unchanged"}]}"#;
+
+    let initial_response = forward_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .body(Body::from(message.as_slice()))
+            .expect("build first request"),
+    )
+    .await
+    .expect("forward initial request");
+    assert_eq!(initial_response.status(), StatusCode::OK);
+    to_bytes(initial_response.into_body(), usize::MAX)
+        .await
+        .expect("read initial response body");
+
+    let limit_response = forward_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("x-codex-turn-state", "same-turn")
+            .body(Body::from(tool_output.as_slice()))
+            .expect("build follow-up request"),
+    )
+    .await
+    .expect("forward follow-up request");
+    let limit_content_length = limit_response
+        .headers()
+        .get("content-length")
+        .expect("limit response content length")
+        .to_str()
+        .expect("content length is text")
+        .parse::<usize>()
+        .expect("content length is numeric");
+    let limit_body = to_bytes(limit_response.into_body(), usize::MAX)
+        .await
+        .expect("read limit response body");
+
+    let retry_response = forward_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .body(Body::from(message.as_slice()))
+            .expect("build retry request"),
+    )
+    .await
+    .expect("forward retry request");
+    let retry_status = retry_response.status();
+    let retry_body = to_bytes(retry_response.into_body(), usize::MAX)
+        .await
+        .expect("read retry response body");
+    let limit_json: serde_json::Value =
+        serde_json::from_slice(&limit_body).expect("parse limit response body");
+    let limit_message = limit_json["error"]["message"].as_str();
+    let captured = captured.lock().expect("lock captured requests");
+
+    assert_eq!(
+        (
+            limit_message,
+            *first.set_aside.lock().expect("lock first set-aside state"),
+            captured
+                .iter()
+                .map(|request| request.body.as_slice())
+                .collect::<Vec<_>>(),
+            captured
+                .iter()
+                .map(|request| request.headers.get(AUTHORIZATION))
+                .collect::<Vec<_>>(),
+            retry_status,
+            retry_body.as_ref(),
+            limit_content_length,
+        ),
+        (
+            Some(
+                "Account 'Pool B' ran out of quota mid-answer. Retry the same message; the next available account will be used."
+            ),
+            Some(AccountSetAside {
+                reason: SetAsideReason::OpenAiHardRefusal,
+                returns_at: 4_102_444_800,
+            }),
+            vec![
+                message.as_slice(),
+                tool_output.as_slice(),
+                message.as_slice()
+            ],
+            vec![
+                Some(&HeaderValue::from_static("Bearer first-token")),
+                Some(&HeaderValue::from_static("Bearer first-token")),
+                Some(&HeaderValue::from_static("Bearer second-token")),
+            ],
+            StatusCode::OK,
+            b"retry succeeded".as_slice(),
+            limit_body.len(),
+        )
+    );
+}
+
 #[test]
 fn message_with_several_tool_steps_keeps_one_boundary_for_normal_and_streaming_requests() {
     let detector = MessageBoundaryDetector;

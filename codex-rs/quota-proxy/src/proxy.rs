@@ -10,6 +10,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use axum::Router;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
@@ -17,7 +18,9 @@ use axum::http::Request;
 use axum::http::Response;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
+use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::HOST;
+use futures::StreamExt;
 use futures::TryStreamExt;
 use reqwest::Url;
 use serde::Deserialize;
@@ -63,32 +66,6 @@ struct HardRefusalError {
     #[serde(rename = "type")]
     kind: String,
     resets_at: i64,
-}
-
-#[derive(Default)]
-struct HardRefusalReader {
-    pending: Vec<u8>,
-    recorded: bool,
-}
-
-impl HardRefusalReader {
-    fn read(&mut self, chunk: &[u8], mut record: impl FnMut(i64)) {
-        if self.recorded {
-            return;
-        }
-        if self.pending.len() + chunk.len() > MAX_STREAMING_USAGE_EVENT_BYTES {
-            self.pending.clear();
-            self.recorded = true;
-            return;
-        }
-        self.pending.extend_from_slice(chunk);
-        if let Ok(response) = serde_json::from_slice::<HardRefusalResponse>(&self.pending)
-            && response.error.kind == "usage_limit_reached"
-        {
-            self.recorded = true;
-            record(response.error.resets_at);
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,28 +498,72 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
         .await
         .context("upstream request failed")?;
     let status = upstream.status();
-    let headers = end_to_end_headers(upstream.headers());
+    let mut headers = end_to_end_headers(upstream.headers());
     record_reply_usage(&paying_account, &headers);
 
-    // Keep the upstream body as a stream from socket to socket.
-    let streaming_account = paying_account.clone();
-    let mut streaming_usage = StreamingUsageReader::default();
-    let mut hard_refusal =
-        (status == StatusCode::TOO_MANY_REQUESTS).then(HardRefusalReader::default);
-    let body = upstream.bytes_stream().inspect_ok(move |chunk| {
-        streaming_usage.read(chunk, |usage| {
-            record_account_usage(&streaming_account, usage);
-        });
-        if let Some(hard_refusal) = &mut hard_refusal {
-            hard_refusal.read(chunk, |returns_at| {
-                streaming_account.set_aside(SetAsideReason::OpenAiHardRefusal, returns_at);
-            });
-        }
-    });
-    let mut response = Response::new(Body::from_stream(body));
+    let (body, rewritten_length) = if status == StatusCode::TOO_MANY_REQUESTS {
+        hard_refusal_body(&paying_account, upstream).await?
+    } else {
+        // Keep successful upstream replies streaming from socket to socket.
+        let streaming_account = paying_account.clone();
+        let mut streaming_usage = StreamingUsageReader::default();
+        (
+            Body::from_stream(upstream.bytes_stream().inspect_ok(move |chunk| {
+                streaming_usage.read(chunk, |usage| {
+                    record_account_usage(&streaming_account, usage);
+                });
+            })),
+            None,
+        )
+    };
+    if let Some(rewritten_length) = rewritten_length {
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&rewritten_length.to_string())
+                .context("rewritten response length is invalid")?,
+        );
+    }
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response)
+}
+
+async fn hard_refusal_body(
+    account: &PayingAccount,
+    upstream: reqwest::Response,
+) -> Result<(Body, Option<usize>)> {
+    let mut stream = upstream.bytes_stream();
+    let mut pending = Vec::new();
+    while let Some(chunk) = stream.try_next().await.context("upstream request failed")? {
+        if pending.len() + chunk.len() > MAX_STREAMING_USAGE_EVENT_BYTES {
+            let initial = futures::stream::iter([
+                Ok::<_, reqwest::Error>(Bytes::from(pending)),
+                Ok::<_, reqwest::Error>(chunk),
+            ]);
+            return Ok((Body::from_stream(initial.chain(stream)), None));
+        }
+        pending.extend_from_slice(&chunk);
+    }
+
+    let Ok(refusal) = serde_json::from_slice::<HardRefusalResponse>(&pending) else {
+        return Ok((Body::from(pending), None));
+    };
+    if refusal.error.kind != "usage_limit_reached" {
+        return Ok((Body::from(pending), None));
+    }
+    account.set_aside(SetAsideReason::OpenAiHardRefusal, refusal.error.resets_at);
+    let message = format!(
+        "Account '{}' ran out of quota mid-answer. Retry the same message; the next available account will be used.",
+        account.label
+    );
+    eprintln!("{message}");
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&pending).context("could not parse OpenAI hard refusal")?;
+    response["error"]["message"] = serde_json::Value::String(message);
+    let body = serde_json::to_vec(&response).context("could not rewrite OpenAI hard refusal")?;
+    let length = body.len();
+    Ok((Body::from(body), Some(length)))
 }
 
 fn record_reply_usage(account: &PayingAccount, headers: &HeaderMap) {
