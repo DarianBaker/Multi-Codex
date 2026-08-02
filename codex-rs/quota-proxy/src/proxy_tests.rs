@@ -60,13 +60,21 @@ async fn forwarding_replaces_account_headers_without_changing_body() {
         client: reqwest::Client::new(),
         upstream_base: Url::parse(&format!("http://{upstream_addr}"))
             .expect("parse test upstream URL"),
-        paying_account: PayingAccount {
-            label: "Pool B".to_string(),
-            access_token: "secondary-token".to_string(),
-            account_id: "secondary-account".to_string(),
-            usage: Arc::new(Mutex::new(None)),
-            usage_store: None,
-        },
+        account_selector: Arc::new(AccountSelector::new(vec![AccountCandidate {
+            account: PayingAccount {
+                label: "Pool B".to_string(),
+                access_token: "secondary-token".to_string(),
+                account_id: "secondary-account".to_string(),
+                usage: Arc::new(Mutex::new(None)),
+                usage_store: None,
+                set_aside: Arc::new(Mutex::new(None)),
+            },
+            priority: 1,
+            switch_at_percent: 80.0,
+            is_main: false,
+        }])),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
     };
     let body = br#"{"input":[{"role":"user","content":"keep this exactly"}]}"#;
     let request = Request::builder()
@@ -120,7 +128,11 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
     });
 
     let mut state = test_state(upstream_addr);
-    state.paying_account.usage_store = Some(Arc::new(UsageStore::load(&usage_path, 0).store));
+    Arc::get_mut(&mut state.account_selector)
+        .expect("test owns account selector")
+        .accounts[0]
+        .account
+        .usage_store = Some(Arc::new(UsageStore::load(&usage_path, 0).store));
     let request = Request::builder()
         .method("POST")
         .uri("/responses")
@@ -133,9 +145,9 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
 
     assert_eq!(
         (
-            state.paying_account.label.as_str(),
-            *state
-                .paying_account
+            state.account_selector.accounts[0].account.label.as_str(),
+            *state.account_selector.accounts[0]
+                .account
                 .usage
                 .lock()
                 .expect("lock paying account usage"),
@@ -155,6 +167,7 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
     assert_eq!(
         persisted,
         json!({
+            "paying_account": "Pool B",
             "accounts": {
                 "Pool B": {
                     "used_percent": 12.5,
@@ -185,8 +198,8 @@ async fn reply_without_usage_preserves_paying_account_usage() {
         window_minutes: 60,
         resets_at: 1_800_000_000,
     };
-    *state
-        .paying_account
+    *state.account_selector.accounts[0]
+        .account
         .usage
         .lock()
         .expect("lock paying account usage") = Some(existing);
@@ -201,8 +214,8 @@ async fn reply_without_usage_preserves_paying_account_usage() {
         .expect("forward request");
 
     assert_eq!(
-        *state
-            .paying_account
+        *state.account_selector.accounts[0]
+            .account
             .usage
             .lock()
             .expect("lock paying account usage"),
@@ -259,8 +272,8 @@ async fn forwarding_reads_midstream_usage_without_delaying_or_altering_reply() {
     let mut received = read_next_sse_event(&mut body).await;
 
     assert_eq!(
-        *state
-            .paying_account
+        *state.account_selector.accounts[0]
+            .account
             .usage
             .lock()
             .expect("lock paying account usage"),
@@ -276,8 +289,8 @@ async fn forwarding_reads_midstream_usage_without_delaying_or_altering_reply() {
         .expect("release matching usage event");
     received.extend(read_next_sse_event(&mut body).await);
     assert_eq!(
-        *state
-            .paying_account
+        *state.account_selector.accounts[0]
+            .account
             .usage
             .lock()
             .expect("lock paying account usage"),
@@ -300,6 +313,278 @@ async fn forwarding_reads_midstream_usage_without_delaying_or_altering_reply() {
     assert_eq!(
         received,
         format!("{MIDSTREAM_USAGE}{HEADER_MATCHING_USAGE}{COMPLETED_REPLY}").into_bytes()
+    );
+}
+
+#[tokio::test]
+async fn mid_answer_limit_explains_retry_and_retry_uses_next_account_without_changing_history() {
+    let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let app = Router::new().route(
+        "/responses",
+        post({
+            let captured = Arc::clone(&captured);
+            move |request: Request<Body>| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let body = to_bytes(body, usize::MAX)
+                        .await
+                        .expect("read forwarded body")
+                        .to_vec();
+                    let mut captured = captured.lock().expect("lock captured requests");
+                    captured.push(CapturedRequest {
+                        headers: parts.headers,
+                        body,
+                    });
+                    if captured.len() == 2 {
+                        let mut response = Response::new(Body::from(
+                            r#"{"error":{"type":"usage_limit_reached","message":"upstream limit","resets_at":4102444800}}"#,
+                        ));
+                        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                        response
+                    } else {
+                        Response::new(Body::from(if captured.len() == 1 {
+                            "tool requested"
+                        } else {
+                            "retry succeeded"
+                        }))
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test upstream");
+    let upstream_addr = listener.local_addr().expect("read test upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve test upstream");
+    });
+
+    let first = PayingAccount {
+        label: "Pool B".to_string(),
+        access_token: "first-token".to_string(),
+        account_id: "first-account".to_string(),
+        usage: Arc::new(Mutex::new(None)),
+        usage_store: None,
+        set_aside: Arc::new(Mutex::new(None)),
+    };
+    let second = PayingAccount {
+        label: "Pool C".to_string(),
+        access_token: "second-token".to_string(),
+        account_id: "second-account".to_string(),
+        usage: Arc::new(Mutex::new(None)),
+        usage_store: None,
+        set_aside: Arc::new(Mutex::new(None)),
+    };
+    let state = ProxyState {
+        client: reqwest::Client::new(),
+        upstream_base: Url::parse(&format!("http://{upstream_addr}"))
+            .expect("parse test upstream URL"),
+        account_selector: Arc::new(AccountSelector::new(vec![
+            AccountCandidate {
+                account: first.clone(),
+                priority: 1,
+                switch_at_percent: 80.0,
+                is_main: false,
+            },
+            AccountCandidate {
+                account: second,
+                priority: 2,
+                switch_at_percent: 80.0,
+                is_main: false,
+            },
+        ])),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
+    };
+    let message = br#"{"input":[{"role":"user","content":"keep history exactly"}]}"#;
+    let tool_output =
+        br#"{"input":[{"type":"function_call_output","call_id":"call-1","output":"unchanged"}]}"#;
+
+    let initial_response = forward_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .body(Body::from(message.as_slice()))
+            .expect("build first request"),
+    )
+    .await
+    .expect("forward initial request");
+    assert_eq!(initial_response.status(), StatusCode::OK);
+    to_bytes(initial_response.into_body(), usize::MAX)
+        .await
+        .expect("read initial response body");
+
+    let limit_response = forward_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("x-codex-turn-state", "same-turn")
+            .body(Body::from(tool_output.as_slice()))
+            .expect("build follow-up request"),
+    )
+    .await
+    .expect("forward follow-up request");
+    let limit_content_length = limit_response
+        .headers()
+        .get("content-length")
+        .expect("limit response content length")
+        .to_str()
+        .expect("content length is text")
+        .parse::<usize>()
+        .expect("content length is numeric");
+    let limit_body = to_bytes(limit_response.into_body(), usize::MAX)
+        .await
+        .expect("read limit response body");
+
+    let retry_response = forward_request(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .body(Body::from(message.as_slice()))
+            .expect("build retry request"),
+    )
+    .await
+    .expect("forward retry request");
+    let retry_status = retry_response.status();
+    let retry_body = to_bytes(retry_response.into_body(), usize::MAX)
+        .await
+        .expect("read retry response body");
+    let limit_json: serde_json::Value =
+        serde_json::from_slice(&limit_body).expect("parse limit response body");
+    let limit_message = limit_json["error"]["message"].as_str();
+    let captured = captured.lock().expect("lock captured requests");
+
+    assert_eq!(
+        (
+            limit_message,
+            *first.set_aside.lock().expect("lock first set-aside state"),
+            captured
+                .iter()
+                .map(|request| request.body.as_slice())
+                .collect::<Vec<_>>(),
+            captured
+                .iter()
+                .map(|request| request.headers.get(AUTHORIZATION))
+                .collect::<Vec<_>>(),
+            retry_status,
+            retry_body.as_ref(),
+            limit_content_length,
+        ),
+        (
+            Some(
+                "Account 'Pool B' ran out of quota mid-answer. Retry the same message; the next available account will be used."
+            ),
+            Some(AccountSetAside {
+                reason: SetAsideReason::OpenAiHardRefusal,
+                returns_at: 4_102_444_800,
+            }),
+            vec![
+                message.as_slice(),
+                tool_output.as_slice(),
+                message.as_slice()
+            ],
+            vec![
+                Some(&HeaderValue::from_static("Bearer first-token")),
+                Some(&HeaderValue::from_static("Bearer first-token")),
+                Some(&HeaderValue::from_static("Bearer second-token")),
+            ],
+            StatusCode::OK,
+            b"retry succeeded".as_slice(),
+            limit_body.len(),
+        )
+    );
+}
+
+#[test]
+fn message_with_several_tool_steps_keeps_one_boundary_for_normal_and_streaming_requests() {
+    let detector = MessageBoundaryDetector;
+    let mut follow_up_headers = HeaderMap::new();
+    follow_up_headers.insert("x-codex-turn-state", HeaderValue::from_static("same-turn"));
+    let requests = [
+        (
+            HeaderMap::new(),
+            json!({
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": "start"
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            follow_up_headers.clone(),
+            json!({
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "first"
+                }],
+                "stream": false
+            }),
+        ),
+        (
+            follow_up_headers.clone(),
+            json!({
+                "input": [{
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-2",
+                    "output": "second"
+                }],
+                "stream": true
+            }),
+        ),
+        (
+            follow_up_headers,
+            json!({
+                "input": [{
+                    "type": "tool_search_output",
+                    "call_id": "call-3",
+                    "status": "completed",
+                    "tools": []
+                }],
+                "stream": true
+            }),
+        ),
+        (
+            HeaderMap::new(),
+            json!({
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": "next"
+                }],
+                "stream": true
+            }),
+        ),
+    ];
+
+    let actual = requests
+        .iter()
+        .map(|(headers, body)| {
+            (
+                detector.classify(headers),
+                body["stream"].as_bool().expect("request stream flag"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual,
+        vec![
+            (MessageRequestKind::NewMessage, false),
+            (MessageRequestKind::FollowUp, false),
+            (MessageRequestKind::FollowUp, true),
+            (MessageRequestKind::FollowUp, true),
+            (MessageRequestKind::NewMessage, true),
+        ]
     );
 }
 
@@ -358,13 +643,21 @@ fn test_state(upstream_addr: SocketAddr) -> ProxyState {
         client: reqwest::Client::new(),
         upstream_base: Url::parse(&format!("http://{upstream_addr}"))
             .expect("parse test upstream URL"),
-        paying_account: PayingAccount {
-            label: "Pool B".to_string(),
-            access_token: "secondary-token".to_string(),
-            account_id: "secondary-account".to_string(),
-            usage: Arc::new(Mutex::new(None)),
-            usage_store: None,
-        },
+        account_selector: Arc::new(AccountSelector::new(vec![AccountCandidate {
+            account: PayingAccount {
+                label: "Pool B".to_string(),
+                access_token: "secondary-token".to_string(),
+                account_id: "secondary-account".to_string(),
+                usage: Arc::new(Mutex::new(None)),
+                usage_store: None,
+                set_aside: Arc::new(Mutex::new(None)),
+            },
+            priority: 1,
+            switch_at_percent: 80.0,
+            is_main: false,
+        }])),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
     }
 }
 

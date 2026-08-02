@@ -10,6 +10,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use axum::Router;
 use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
@@ -17,16 +18,20 @@ use axum::http::Request;
 use axum::http::Response;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
+use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::HOST;
+use futures::StreamExt;
 use futures::TryStreamExt;
 use reqwest::Url;
 use serde::Deserialize;
 
 use crate::LoadedAccountCredentials;
+use crate::PoolSettings;
 use crate::usage::AccountUsage;
 use crate::usage::UsageStore;
 
 const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
+const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const PRIMARY_RESET_AT: &str = "x-codex-primary-reset-at";
 const PRIMARY_USED_PERCENT: &str = "x-codex-primary-used-percent";
 const PRIMARY_WINDOW_MINUTES: &str = "x-codex-primary-window-minutes";
@@ -49,6 +54,37 @@ struct StreamingUsageWindow {
     used_percent: f64,
     window_minutes: i64,
     reset_at: i64,
+}
+
+#[derive(Deserialize)]
+struct HardRefusalResponse {
+    error: HardRefusalError,
+}
+
+#[derive(Deserialize)]
+struct HardRefusalError {
+    #[serde(rename = "type")]
+    kind: String,
+    resets_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageRequestKind {
+    NewMessage,
+    FollowUp,
+}
+
+#[derive(Default)]
+struct MessageBoundaryDetector;
+
+impl MessageBoundaryDetector {
+    fn classify(&self, headers: &HeaderMap) -> MessageRequestKind {
+        if headers.contains_key(X_CODEX_TURN_STATE) {
+            MessageRequestKind::FollowUp
+        } else {
+            MessageRequestKind::NewMessage
+        }
+    }
 }
 
 #[derive(Default)]
@@ -103,61 +139,297 @@ struct PayingAccount {
     account_id: String,
     usage: Arc<Mutex<Option<AccountUsage>>>,
     usage_store: Option<Arc<UsageStore>>,
+    set_aside: Arc<Mutex<Option<AccountSetAside>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountSetAside {
+    reason: SetAsideReason,
+    returns_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetAsideReason {
+    OutOfQuota,
+    OpenAiHardRefusal,
+}
+
+impl SetAsideReason {
+    fn description(self) -> &'static str {
+        match self {
+            Self::OutOfQuota => "reported out of quota",
+            Self::OpenAiHardRefusal => "OpenAI hard refusal",
+        }
+    }
+}
+
+impl PayingAccount {
+    fn set_aside(&self, reason: SetAsideReason, returns_at: i64) {
+        *self
+            .set_aside
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(AccountSetAside { reason, returns_at });
+        eprintln!(
+            "set aside account '{}': {} until {} (Unix seconds)",
+            self.label,
+            reason.description(),
+            returns_at
+        );
+    }
+}
+
+struct AccountCandidate {
+    account: PayingAccount,
+    priority: u32,
+    switch_at_percent: f64,
+    is_main: bool,
+}
+
+struct AccountSelector {
+    accounts: Vec<AccountCandidate>,
+}
+
+impl AccountSelector {
+    fn new(mut accounts: Vec<AccountCandidate>) -> Self {
+        accounts.sort_by_key(|candidate| candidate.priority);
+        Self { accounts }
+    }
+
+    fn select(&self) -> Result<PayingAccount> {
+        let now = unix_now()?;
+        self.select_at(now)
+    }
+
+    fn select_at(&self, now: i64) -> Result<PayingAccount> {
+        let mut main: Option<&AccountCandidate> = None;
+        for candidate in &self.accounts {
+            if candidate.is_main {
+                main = Some(candidate);
+                continue;
+            }
+            let set_aside = *candidate
+                .account
+                .set_aside
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(set_aside) = set_aside
+                && set_aside.returns_at > now
+            {
+                eprintln!(
+                    "skipping set-aside account '{}': {}; returns at {} (Unix seconds)",
+                    candidate.account.label,
+                    set_aside.reason.description(),
+                    set_aside.returns_at
+                );
+                continue;
+            }
+            if set_aside.is_some() {
+                *candidate
+                    .account
+                    .set_aside
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+            let mut known_usage = candidate
+                .account
+                .usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if known_usage.is_some_and(|usage| usage.resets_at <= now) {
+                *known_usage = None;
+            }
+            let usage = *known_usage;
+            drop(known_usage);
+            match usage {
+                Some(usage) if usage.used_percent >= candidate.switch_at_percent => {
+                    eprintln!(
+                        "skipping account '{}' at priority {}: {:.1}% used is at or above {:.1}% switch-over",
+                        candidate.account.label,
+                        candidate.priority,
+                        usage.used_percent,
+                        candidate.switch_at_percent
+                    );
+                }
+                Some(usage) => {
+                    eprintln!(
+                        "selected account '{}' at priority {}: {:.1}% used is below {:.1}% switch-over",
+                        candidate.account.label,
+                        candidate.priority,
+                        usage.used_percent,
+                        candidate.switch_at_percent
+                    );
+                    if let Some(store) = &candidate.account.usage_store
+                        && let Err(error) = store.set_paying_account(&candidate.account.label)
+                    {
+                        eprintln!("could not save paying account: {error}");
+                    }
+                    return Ok(candidate.account.clone());
+                }
+                None => {
+                    eprintln!(
+                        "selected account '{}' at priority {}: usage unavailable, treated as having room below {:.1}% switch-over",
+                        candidate.account.label, candidate.priority, candidate.switch_at_percent
+                    );
+                    if let Some(store) = &candidate.account.usage_store
+                        && let Err(error) = store.set_paying_account(&candidate.account.label)
+                    {
+                        eprintln!("could not save paying account: {error}");
+                    }
+                    return Ok(candidate.account.clone());
+                }
+            }
+        }
+        if let Some(candidate) = main {
+            let set_aside = *candidate
+                .account
+                .set_aside
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(set_aside) = set_aside
+                && set_aside.returns_at > now
+            {
+                eprintln!(
+                    "skipping set-aside account '{}': {}; returns at {} (Unix seconds)",
+                    candidate.account.label,
+                    set_aside.reason.description(),
+                    set_aside.returns_at
+                );
+                return Err(anyhow!(
+                    "no account has room below its switch-over percentage"
+                ));
+            }
+            if set_aside.is_some() {
+                *candidate
+                    .account
+                    .set_aside
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+            let mut known_usage = candidate
+                .account
+                .usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if known_usage.is_some_and(|usage| usage.resets_at <= now) {
+                *known_usage = None;
+            }
+            drop(known_usage);
+            eprintln!(
+                "pool exhausted; main account '{}' is now paying",
+                candidate.account.label
+            );
+            if let Some(store) = &candidate.account.usage_store
+                && let Err(error) = store.set_paying_account(&candidate.account.label)
+            {
+                eprintln!("could not save paying account: {error}");
+            }
+            return Ok(candidate.account.clone());
+        }
+        Err(anyhow!(
+            "no account has room below its switch-over percentage"
+        ))
+    }
+}
+
+#[derive(Default)]
+struct MessageAccountPin {
+    pinned: Mutex<Option<PayingAccount>>,
+}
+
+impl MessageAccountPin {
+    fn account_for_request(
+        &self,
+        kind: MessageRequestKind,
+        select: impl FnOnce() -> Result<PayingAccount>,
+    ) -> Result<PayingAccount> {
+        let mut pinned = self
+            .pinned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kind == MessageRequestKind::NewMessage {
+            *pinned = None;
+        }
+        if pinned.is_none() {
+            *pinned = Some(select()?);
+        }
+        pinned
+            .as_ref()
+            .cloned()
+            .context("message has no paying account")
+    }
 }
 
 #[derive(Clone)]
 struct ProxyState {
     client: reqwest::Client,
     upstream_base: Url,
-    paying_account: PayingAccount,
+    account_selector: Arc<AccountSelector>,
+    message_boundary: Arc<MessageBoundaryDetector>,
+    account_pin: Arc<MessageAccountPin>,
 }
 
 /// Starts the transparent HTTP proxy and serves requests until it is stopped.
 pub async fn serve(
-    listen_addr: &str,
-    upstream_base: &str,
-    account: LoadedAccountCredentials,
+    settings: &PoolSettings,
+    accounts: Vec<LoadedAccountCredentials>,
     usage_path: PathBuf,
 ) -> Result<()> {
-    let listen_addr: SocketAddr = listen_addr
+    let listen_addr: SocketAddr = settings
+        .listen_addr
         .parse()
-        .with_context(|| format!("listen_addr '{listen_addr}' is invalid"))?;
-    let upstream_base = Url::parse(upstream_base).context("upstream_base URL is invalid")?;
+        .with_context(|| format!("listen_addr '{}' is invalid", settings.listen_addr))?;
+    let upstream_base =
+        Url::parse(&settings.upstream_base).context("upstream_base URL is invalid")?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("could not create upstream client")?;
-    let tokens = account
-        .credentials
-        .tokens
-        .context("chosen account has no login tokens")?;
-    let account_id = tokens
-        .account_id
-        .or(tokens.id_token.chatgpt_account_id)
-        .context("chosen account has no account identifier")?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system time is before the Unix epoch")?
-        .as_secs() as i64;
+    let now = unix_now()?;
     let loaded_usage = UsageStore::load(usage_path, now);
     if let Some(warning) = loaded_usage.warning {
         eprintln!("{warning}");
     }
-    if let Err(error) = loaded_usage.store.set_paying_account(&account.label) {
-        eprintln!("could not save paying account: {error}");
-    }
     let usage_store = Arc::new(loaded_usage.store);
-    let usage = usage_store.get(&account.label);
+    let mut candidates = Vec::new();
+    for account in accounts {
+        let profile = settings
+            .profiles
+            .iter()
+            .find(|profile| profile.label == account.label)
+            .with_context(|| format!("loaded account '{}' is missing settings", account.label))?;
+        let tokens = account
+            .credentials
+            .tokens
+            .context("chosen account has no login tokens")?;
+        let account_id = tokens
+            .account_id
+            .or(tokens.id_token.chatgpt_account_id)
+            .context("chosen account has no account identifier")?;
+        let usage = usage_store.get(&account.label);
+        candidates.push(AccountCandidate {
+            account: PayingAccount {
+                label: account.label,
+                access_token: tokens.access_token,
+                account_id,
+                usage: Arc::new(Mutex::new(usage)),
+                usage_store: Some(Arc::clone(&usage_store)),
+                set_aside: Arc::new(Mutex::new(None)),
+            },
+            priority: profile.priority,
+            switch_at_percent: settings.switch_at_percent_for(profile),
+            is_main: profile.is_main,
+        });
+    }
+    if candidates.is_empty() {
+        return Err(anyhow!("no usable account"));
+    }
     let state = ProxyState {
         client,
         upstream_base,
-        paying_account: PayingAccount {
-            label: account.label,
-            access_token: tokens.access_token,
-            account_id,
-            usage: Arc::new(Mutex::new(usage)),
-            usage_store: Some(usage_store),
-        },
+        account_selector: Arc::new(AccountSelector::new(candidates)),
+        message_boundary: Arc::new(MessageBoundaryDetector),
+        account_pin: Arc::new(MessageAccountPin::default()),
     };
     let app = Router::new().fallback(forward).with_state(state);
     let listener = tokio::net::TcpListener::bind(listen_addr)
@@ -174,7 +446,6 @@ pub async fn serve(
 }
 
 async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
-    eprintln!("request paid by account '{}'", state.paying_account.label);
     match forward_request(&state, request).await {
         Ok(response) => response,
         Err(error) => {
@@ -188,6 +459,15 @@ async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Res
 
 async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<Response<Body>> {
     let (parts, body) = request.into_parts();
+    let kind = state.message_boundary.classify(&parts.headers);
+    match kind {
+        MessageRequestKind::NewMessage => eprintln!("request starts a new message"),
+        MessageRequestKind::FollowUp => eprintln!("request continues the current message"),
+    }
+    let paying_account = state
+        .account_pin
+        .account_for_request(kind, || state.account_selector.select())?;
+    eprintln!("request paid by account '{}'", paying_account.label);
     let request_target = parts
         .uri
         .path_and_query()
@@ -199,12 +479,12 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     headers.remove(CHATGPT_ACCOUNT_ID);
     headers.insert(
         AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", state.paying_account.access_token))
+        HeaderValue::from_str(&format!("Bearer {}", paying_account.access_token))
             .context("chosen account access token is invalid")?,
     );
     headers.insert(
         CHATGPT_ACCOUNT_ID,
-        HeaderValue::from_str(&state.paying_account.account_id)
+        HeaderValue::from_str(&paying_account.account_id)
             .context("chosen account identifier is invalid")?,
     );
     headers.insert(HOST, upstream_host(&state.upstream_base)?);
@@ -218,53 +498,106 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
         .await
         .context("upstream request failed")?;
     let status = upstream.status();
-    let headers = end_to_end_headers(upstream.headers());
-    record_reply_usage(&state.paying_account, &headers);
+    let mut headers = end_to_end_headers(upstream.headers());
+    record_reply_usage(&paying_account, &headers);
 
-    // Keep the upstream body as a stream from socket to socket.
-    let known_usage = Arc::clone(&state.paying_account.usage);
-    let usage_label = state.paying_account.label.clone();
-    let usage_store = state.paying_account.usage_store.clone();
-    let mut streaming_usage = StreamingUsageReader::default();
-    let body = upstream.bytes_stream().inspect_ok(move |chunk| {
-        streaming_usage.read(chunk, |usage| {
-            store_usage(&known_usage, &usage_label, usage_store.as_deref(), usage);
-        });
-    });
-    let mut response = Response::new(Body::from_stream(body));
+    let (body, rewritten_length) = if status == StatusCode::TOO_MANY_REQUESTS {
+        hard_refusal_body(&paying_account, upstream).await?
+    } else {
+        // Keep successful upstream replies streaming from socket to socket.
+        let streaming_account = paying_account.clone();
+        let mut streaming_usage = StreamingUsageReader::default();
+        (
+            Body::from_stream(upstream.bytes_stream().inspect_ok(move |chunk| {
+                streaming_usage.read(chunk, |usage| {
+                    record_account_usage(&streaming_account, usage);
+                });
+            })),
+            None,
+        )
+    };
+    if let Some(rewritten_length) = rewritten_length {
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&rewritten_length.to_string())
+                .context("rewritten response length is invalid")?,
+        );
+    }
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response)
+}
+
+async fn hard_refusal_body(
+    account: &PayingAccount,
+    upstream: reqwest::Response,
+) -> Result<(Body, Option<usize>)> {
+    let mut stream = upstream.bytes_stream();
+    let mut pending = Vec::new();
+    while let Some(chunk) = stream.try_next().await.context("upstream request failed")? {
+        if pending.len() + chunk.len() > MAX_STREAMING_USAGE_EVENT_BYTES {
+            let initial = futures::stream::iter([
+                Ok::<_, reqwest::Error>(Bytes::from(pending)),
+                Ok::<_, reqwest::Error>(chunk),
+            ]);
+            return Ok((Body::from_stream(initial.chain(stream)), None));
+        }
+        pending.extend_from_slice(&chunk);
+    }
+
+    let Ok(refusal) = serde_json::from_slice::<HardRefusalResponse>(&pending) else {
+        return Ok((Body::from(pending), None));
+    };
+    if refusal.error.kind != "usage_limit_reached" {
+        return Ok((Body::from(pending), None));
+    }
+    account.set_aside(SetAsideReason::OpenAiHardRefusal, refusal.error.resets_at);
+    let message = format!(
+        "Account '{}' ran out of quota mid-answer. Retry the same message; the next available account will be used.",
+        account.label
+    );
+    eprintln!("{message}");
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&pending).context("could not parse OpenAI hard refusal")?;
+    response["error"]["message"] = serde_json::Value::String(message);
+    let body = serde_json::to_vec(&response).context("could not rewrite OpenAI hard refusal")?;
+    let length = body.len();
+    Ok((Body::from(body), Some(length)))
 }
 
 fn record_reply_usage(account: &PayingAccount, headers: &HeaderMap) {
     let Some(usage) = reply_usage(headers) else {
         return;
     };
-    store_usage(
-        &account.usage,
-        &account.label,
-        account.usage_store.as_deref(),
-        usage,
-    );
+    record_account_usage(account, usage);
 }
 
-fn store_usage(
-    known_usage: &Mutex<Option<AccountUsage>>,
-    label: &str,
-    usage_store: Option<&UsageStore>,
-    usage: AccountUsage,
-) {
-    let mut known_usage = known_usage
+fn record_account_usage(account: &PayingAccount, usage: AccountUsage) {
+    let mut known_usage = account
+        .usage
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *known_usage = Some(usage);
     drop(known_usage);
-    if let Some(usage_store) = usage_store
-        && let Err(error) = usage_store.record(label, usage)
-    {
-        eprintln!("could not save usage for account '{label}': {error}");
+    if usage.used_percent >= 100.0 {
+        account.set_aside(SetAsideReason::OutOfQuota, usage.resets_at);
     }
+    if let Some(usage_store) = &account.usage_store
+        && let Err(error) = usage_store.record(&account.label, usage)
+    {
+        eprintln!(
+            "could not save usage for account '{}': {error}",
+            account.label
+        );
+    }
+}
+
+fn unix_now() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before the Unix epoch")?
+        .as_secs() as i64)
 }
 
 fn reply_usage(headers: &HeaderMap) -> Option<AccountUsage> {
