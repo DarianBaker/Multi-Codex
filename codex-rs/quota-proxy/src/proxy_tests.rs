@@ -60,13 +60,17 @@ async fn forwarding_replaces_account_headers_without_changing_body() {
         client: reqwest::Client::new(),
         upstream_base: Url::parse(&format!("http://{upstream_addr}"))
             .expect("parse test upstream URL"),
-        paying_account: PayingAccount {
-            label: "Pool B".to_string(),
-            access_token: "secondary-token".to_string(),
-            account_id: "secondary-account".to_string(),
-            usage: Arc::new(Mutex::new(None)),
-            usage_store: None,
-        },
+        account_selector: Arc::new(AccountSelector::new(vec![AccountCandidate {
+            account: PayingAccount {
+                label: "Pool B".to_string(),
+                access_token: "secondary-token".to_string(),
+                account_id: "secondary-account".to_string(),
+                usage: Arc::new(Mutex::new(None)),
+                usage_store: None,
+            },
+            priority: 1,
+            switch_at_percent: 80.0,
+        }])),
         message_boundary: Arc::new(MessageBoundaryDetector),
         account_pin: Arc::new(MessageAccountPin::default()),
     };
@@ -122,7 +126,11 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
     });
 
     let mut state = test_state(upstream_addr);
-    state.paying_account.usage_store = Some(Arc::new(UsageStore::load(&usage_path, 0).store));
+    Arc::get_mut(&mut state.account_selector)
+        .expect("test owns account selector")
+        .accounts[0]
+        .account
+        .usage_store = Some(Arc::new(UsageStore::load(&usage_path, 0).store));
     let request = Request::builder()
         .method("POST")
         .uri("/responses")
@@ -135,9 +143,9 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
 
     assert_eq!(
         (
-            state.paying_account.label.as_str(),
-            *state
-                .paying_account
+            state.account_selector.accounts[0].account.label.as_str(),
+            *state.account_selector.accounts[0]
+                .account
                 .usage
                 .lock()
                 .expect("lock paying account usage"),
@@ -157,6 +165,7 @@ async fn forwarding_records_reply_usage_for_the_paying_account() {
     assert_eq!(
         persisted,
         json!({
+            "paying_account": "Pool B",
             "accounts": {
                 "Pool B": {
                     "used_percent": 12.5,
@@ -187,8 +196,8 @@ async fn reply_without_usage_preserves_paying_account_usage() {
         window_minutes: 60,
         resets_at: 1_800_000_000,
     };
-    *state
-        .paying_account
+    *state.account_selector.accounts[0]
+        .account
         .usage
         .lock()
         .expect("lock paying account usage") = Some(existing);
@@ -203,8 +212,8 @@ async fn reply_without_usage_preserves_paying_account_usage() {
         .expect("forward request");
 
     assert_eq!(
-        *state
-            .paying_account
+        *state.account_selector.accounts[0]
+            .account
             .usage
             .lock()
             .expect("lock paying account usage"),
@@ -261,8 +270,8 @@ async fn forwarding_reads_midstream_usage_without_delaying_or_altering_reply() {
     let mut received = read_next_sse_event(&mut body).await;
 
     assert_eq!(
-        *state
-            .paying_account
+        *state.account_selector.accounts[0]
+            .account
             .usage
             .lock()
             .expect("lock paying account usage"),
@@ -278,8 +287,8 @@ async fn forwarding_reads_midstream_usage_without_delaying_or_altering_reply() {
         .expect("release matching usage event");
     received.extend(read_next_sse_event(&mut body).await);
     assert_eq!(
-        *state
-            .paying_account
+        *state.account_selector.accounts[0]
+            .account
             .usage
             .lock()
             .expect("lock paying account usage"),
@@ -446,13 +455,17 @@ fn test_state(upstream_addr: SocketAddr) -> ProxyState {
         client: reqwest::Client::new(),
         upstream_base: Url::parse(&format!("http://{upstream_addr}"))
             .expect("parse test upstream URL"),
-        paying_account: PayingAccount {
-            label: "Pool B".to_string(),
-            access_token: "secondary-token".to_string(),
-            account_id: "secondary-account".to_string(),
-            usage: Arc::new(Mutex::new(None)),
-            usage_store: None,
-        },
+        account_selector: Arc::new(AccountSelector::new(vec![AccountCandidate {
+            account: PayingAccount {
+                label: "Pool B".to_string(),
+                access_token: "secondary-token".to_string(),
+                account_id: "secondary-account".to_string(),
+                usage: Arc::new(Mutex::new(None)),
+                usage_store: None,
+            },
+            priority: 1,
+            switch_at_percent: 80.0,
+        }])),
         message_boundary: Arc::new(MessageBoundaryDetector),
         account_pin: Arc::new(MessageAccountPin::default()),
     }

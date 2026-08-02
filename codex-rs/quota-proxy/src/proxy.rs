@@ -23,6 +23,7 @@ use reqwest::Url;
 use serde::Deserialize;
 
 use crate::LoadedAccountCredentials;
+use crate::PoolSettings;
 use crate::usage::AccountUsage;
 use crate::usage::UsageStore;
 
@@ -125,6 +126,74 @@ struct PayingAccount {
     usage_store: Option<Arc<UsageStore>>,
 }
 
+struct AccountCandidate {
+    account: PayingAccount,
+    priority: u32,
+    switch_at_percent: f64,
+}
+
+struct AccountSelector {
+    accounts: Vec<AccountCandidate>,
+}
+
+impl AccountSelector {
+    fn new(mut accounts: Vec<AccountCandidate>) -> Self {
+        accounts.sort_by_key(|candidate| candidate.priority);
+        Self { accounts }
+    }
+
+    fn select(&self) -> Result<PayingAccount> {
+        for candidate in &self.accounts {
+            let usage = *candidate
+                .account
+                .usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match usage {
+                Some(usage) if usage.used_percent >= candidate.switch_at_percent => {
+                    eprintln!(
+                        "skipping account '{}' at priority {}: {:.1}% used is at or above {:.1}% switch-over",
+                        candidate.account.label,
+                        candidate.priority,
+                        usage.used_percent,
+                        candidate.switch_at_percent
+                    );
+                }
+                Some(usage) => {
+                    eprintln!(
+                        "selected account '{}' at priority {}: {:.1}% used is below {:.1}% switch-over",
+                        candidate.account.label,
+                        candidate.priority,
+                        usage.used_percent,
+                        candidate.switch_at_percent
+                    );
+                    if let Some(store) = &candidate.account.usage_store
+                        && let Err(error) = store.set_paying_account(&candidate.account.label)
+                    {
+                        eprintln!("could not save paying account: {error}");
+                    }
+                    return Ok(candidate.account.clone());
+                }
+                None => {
+                    eprintln!(
+                        "selected account '{}' at priority {}: usage unavailable, treated as having room below {:.1}% switch-over",
+                        candidate.account.label, candidate.priority, candidate.switch_at_percent
+                    );
+                    if let Some(store) = &candidate.account.usage_store
+                        && let Err(error) = store.set_paying_account(&candidate.account.label)
+                    {
+                        eprintln!("could not save paying account: {error}");
+                    }
+                    return Ok(candidate.account.clone());
+                }
+            }
+        }
+        Err(anyhow!(
+            "no account has room below its switch-over percentage"
+        ))
+    }
+}
+
 #[derive(Default)]
 struct MessageAccountPin {
     pinned: Mutex<Option<PayingAccount>>,
@@ -134,8 +203,8 @@ impl MessageAccountPin {
     fn account_for_request(
         &self,
         kind: MessageRequestKind,
-        supplied: PayingAccount,
-    ) -> PayingAccount {
+        select: impl FnOnce() -> Result<PayingAccount>,
+    ) -> Result<PayingAccount> {
         let mut pinned = self
             .pinned
             .lock()
@@ -143,7 +212,13 @@ impl MessageAccountPin {
         if kind == MessageRequestKind::NewMessage {
             *pinned = None;
         }
-        pinned.get_or_insert(supplied).clone()
+        if pinned.is_none() {
+            *pinned = Some(select()?);
+        }
+        pinned
+            .as_ref()
+            .cloned()
+            .context("message has no paying account")
     }
 }
 
@@ -151,34 +226,27 @@ impl MessageAccountPin {
 struct ProxyState {
     client: reqwest::Client,
     upstream_base: Url,
-    paying_account: PayingAccount,
+    account_selector: Arc<AccountSelector>,
     message_boundary: Arc<MessageBoundaryDetector>,
     account_pin: Arc<MessageAccountPin>,
 }
 
 /// Starts the transparent HTTP proxy and serves requests until it is stopped.
 pub async fn serve(
-    listen_addr: &str,
-    upstream_base: &str,
-    account: LoadedAccountCredentials,
+    settings: &PoolSettings,
+    accounts: Vec<LoadedAccountCredentials>,
     usage_path: PathBuf,
 ) -> Result<()> {
-    let listen_addr: SocketAddr = listen_addr
+    let listen_addr: SocketAddr = settings
+        .listen_addr
         .parse()
-        .with_context(|| format!("listen_addr '{listen_addr}' is invalid"))?;
-    let upstream_base = Url::parse(upstream_base).context("upstream_base URL is invalid")?;
+        .with_context(|| format!("listen_addr '{}' is invalid", settings.listen_addr))?;
+    let upstream_base =
+        Url::parse(&settings.upstream_base).context("upstream_base URL is invalid")?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("could not create upstream client")?;
-    let tokens = account
-        .credentials
-        .tokens
-        .context("chosen account has no login tokens")?;
-    let account_id = tokens
-        .account_id
-        .or(tokens.id_token.chatgpt_account_id)
-        .context("chosen account has no account identifier")?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system time is before the Unix epoch")?
@@ -187,21 +255,47 @@ pub async fn serve(
     if let Some(warning) = loaded_usage.warning {
         eprintln!("{warning}");
     }
-    if let Err(error) = loaded_usage.store.set_paying_account(&account.label) {
-        eprintln!("could not save paying account: {error}");
-    }
     let usage_store = Arc::new(loaded_usage.store);
-    let usage = usage_store.get(&account.label);
+    let mut candidates = Vec::new();
+    for account in accounts {
+        let profile = settings
+            .profiles
+            .iter()
+            .find(|profile| profile.label == account.label)
+            .with_context(|| format!("loaded account '{}' is missing settings", account.label))?;
+        if profile.is_main {
+            continue;
+        }
+        let tokens = account
+            .credentials
+            .tokens
+            .context("chosen account has no login tokens")?;
+        let account_id = tokens
+            .account_id
+            .or(tokens.id_token.chatgpt_account_id)
+            .context("chosen account has no account identifier")?;
+        let usage = usage_store.get(&account.label);
+        candidates.push(AccountCandidate {
+            account: PayingAccount {
+                label: account.label,
+                access_token: tokens.access_token,
+                account_id,
+                usage: Arc::new(Mutex::new(usage)),
+                usage_store: Some(Arc::clone(&usage_store)),
+            },
+            priority: profile.priority,
+            switch_at_percent: settings.switch_at_percent_for(profile),
+        });
+    }
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no usable secondary account; main account will not be used"
+        ));
+    }
     let state = ProxyState {
         client,
         upstream_base,
-        paying_account: PayingAccount {
-            label: account.label,
-            access_token: tokens.access_token,
-            account_id,
-            usage: Arc::new(Mutex::new(usage)),
-            usage_store: Some(usage_store),
-        },
+        account_selector: Arc::new(AccountSelector::new(candidates)),
         message_boundary: Arc::new(MessageBoundaryDetector),
         account_pin: Arc::new(MessageAccountPin::default()),
     };
@@ -240,7 +334,7 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     }
     let paying_account = state
         .account_pin
-        .account_for_request(kind, state.paying_account.clone());
+        .account_for_request(kind, || state.account_selector.select())?;
     eprintln!("request paid by account '{}'", paying_account.label);
     let request_target = parts
         .uri

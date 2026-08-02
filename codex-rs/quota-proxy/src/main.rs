@@ -39,26 +39,9 @@ async fn main() -> Result<()> {
             eprintln!("{error}");
         }
 
-        // Never use the main account as an automatic fallback.
-        let account = report
-            .loaded
-            .into_iter()
-            .find(|account| {
-                settings
-                    .profiles
-                    .iter()
-                    .any(|profile| profile.label == account.label && !profile.is_main)
-            })
-            .context("no usable secondary account; main account will not be used")?;
         let mut usage_path = PathBuf::from(path);
         usage_path.set_extension("usage.json");
-        return serve(
-            &settings.listen_addr,
-            &settings.upstream_base,
-            account,
-            usage_path,
-        )
-        .await;
+        return serve(&settings, report.loaded, usage_path).await;
     }
 
     // Show which build started before later proxy work adds long-running behavior.
