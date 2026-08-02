@@ -226,7 +226,6 @@ impl AccountSelector {
 
     fn select_at(&self, now: i64) -> Result<PayingAccount> {
         let mut main: Option<&AccountCandidate> = None;
-        let mut all_secondary_accounts_set_aside = true;
         for candidate in &self.accounts {
             if candidate.is_main {
                 main = Some(candidate);
@@ -248,7 +247,6 @@ impl AccountSelector {
                 );
                 continue;
             }
-            all_secondary_accounts_set_aside = false;
             if set_aside.is_some() {
                 *candidate
                     .account
@@ -305,7 +303,7 @@ impl AccountSelector {
                 }
             }
         }
-        if all_secondary_accounts_set_aside && let Some(candidate) = main {
+        if let Some(candidate) = main {
             let set_aside = *candidate
                 .account
                 .set_aside
