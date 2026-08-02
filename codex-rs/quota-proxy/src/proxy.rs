@@ -42,6 +42,7 @@ use crate::LoadedAccountCredentials;
 use crate::PoolSettings;
 use crate::usage::AccountUsage;
 use crate::usage::UsageStore;
+use crate::websocket_turn::WebsocketTurnTracker;
 
 const CHATGPT_ACCOUNT_ID: &str = "chatgpt-account-id";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
@@ -524,11 +525,33 @@ async fn forward_websocket(
         "ws" | "wss" => {}
         _ => return Err(anyhow!("upstream URL cannot use WebSocket transport")),
     }
+    let upstream =
+        connect_upstream_websocket(&upstream_url, &parts.headers, &paying_account).await?;
+    let relay_state = state.clone();
+    Ok(websocket
+        .on_upgrade(move |downstream| {
+            relay_websocket(
+                downstream,
+                upstream,
+                relay_state,
+                upstream_url,
+                parts.headers,
+                paying_account,
+            )
+        })
+        .into_response())
+}
+
+async fn connect_upstream_websocket(
+    upstream_url: &Url,
+    headers: &HeaderMap,
+    paying_account: &PayingAccount,
+) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
     let mut upstream_request = upstream_url
         .as_str()
         .into_client_request()
         .context("could not build upstream websocket request")?;
-    for (name, value) in &parts.headers {
+    for (name, value) in headers {
         upstream_request
             .headers_mut()
             .insert(name.clone(), value.clone());
@@ -545,40 +568,75 @@ async fn forward_websocket(
     );
     upstream_request
         .headers_mut()
-        .insert(HOST, upstream_host(&state.upstream_base)?);
+        .insert(HOST, upstream_host(upstream_url)?);
 
     let (upstream, _) = connect_async(upstream_request)
         .await
         .context("upstream websocket connection failed")?;
-    Ok(websocket
-        .on_upgrade(move |downstream| relay_websocket(downstream, upstream))
-        .into_response())
+    Ok(upstream)
 }
 
 async fn relay_websocket(
-    downstream: WebSocket,
-    upstream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    mut downstream: WebSocket,
+    mut upstream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    state: ProxyState,
+    upstream_url: Url,
+    headers: HeaderMap,
+    mut paying_account: PayingAccount,
 ) {
-    let (mut downstream_writer, mut downstream_reader) = downstream.split();
-    let (mut upstream_writer, mut upstream_reader) = upstream.split();
+    let mut turn_tracker = WebsocketTurnTracker::default();
     loop {
         tokio::select! {
-            message = downstream_reader.next() => {
+            message = downstream.next() => {
                 let Some(Ok(message)) = message else {
                     break;
                 };
-                if upstream_writer.send(to_upstream_message(message)).await.is_err() {
+                if let AxumWebSocketMessage::Text(text) = &message
+                    && turn_tracker.starts_new_turn(text)
+                {
+                    let next_account = match state.account_pin.account_for_request(
+                        MessageRequestKind::NewMessage,
+                        || state.account_selector.select(),
+                    ) {
+                        Ok(account) => account,
+                        Err(error) => {
+                            eprintln!("could not select account for new websocket turn: {error}");
+                            break;
+                        }
+                    };
+                    if next_account.account_id != paying_account.account_id {
+                        upstream = match connect_upstream_websocket(
+                            &upstream_url,
+                            &headers,
+                            &next_account,
+                        )
+                        .await
+                        {
+                            Ok(upstream) => upstream,
+                            Err(error) => {
+                                eprintln!("could not switch websocket account: {error}");
+                                break;
+                            }
+                        };
+                    }
+                    paying_account = next_account;
+                    eprintln!(
+                        "new websocket turn paid by account '{}'",
+                        paying_account.label
+                    );
+                }
+                if upstream.send(to_upstream_message(message)).await.is_err() {
                     break;
                 }
             }
-            message = upstream_reader.next() => {
+            message = upstream.next() => {
                 let Some(Ok(message)) = message else {
                     break;
                 };
                 let Some(message) = to_downstream_message(message) else {
                     continue;
                 };
-                if downstream_writer.send(message).await.is_err() {
+                if downstream.send(message).await.is_err() {
                     break;
                 }
             }
