@@ -53,6 +53,44 @@ struct StreamingUsageWindow {
     reset_at: i64,
 }
 
+#[derive(Deserialize)]
+struct HardRefusalResponse {
+    error: HardRefusalError,
+}
+
+#[derive(Deserialize)]
+struct HardRefusalError {
+    #[serde(rename = "type")]
+    kind: String,
+    resets_at: i64,
+}
+
+#[derive(Default)]
+struct HardRefusalReader {
+    pending: Vec<u8>,
+    recorded: bool,
+}
+
+impl HardRefusalReader {
+    fn read(&mut self, chunk: &[u8], mut record: impl FnMut(i64)) {
+        if self.recorded {
+            return;
+        }
+        if self.pending.len() + chunk.len() > MAX_STREAMING_USAGE_EVENT_BYTES {
+            self.pending.clear();
+            self.recorded = true;
+            return;
+        }
+        self.pending.extend_from_slice(chunk);
+        if let Ok(response) = serde_json::from_slice::<HardRefusalResponse>(&self.pending)
+            && response.error.kind == "usage_limit_reached"
+        {
+            self.recorded = true;
+            record(response.error.resets_at);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MessageRequestKind {
     NewMessage,
@@ -124,6 +162,44 @@ struct PayingAccount {
     account_id: String,
     usage: Arc<Mutex<Option<AccountUsage>>>,
     usage_store: Option<Arc<UsageStore>>,
+    set_aside: Arc<Mutex<Option<AccountSetAside>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountSetAside {
+    reason: SetAsideReason,
+    returns_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetAsideReason {
+    OutOfQuota,
+    OpenAiHardRefusal,
+}
+
+impl SetAsideReason {
+    fn description(self) -> &'static str {
+        match self {
+            Self::OutOfQuota => "reported out of quota",
+            Self::OpenAiHardRefusal => "OpenAI hard refusal",
+        }
+    }
+}
+
+impl PayingAccount {
+    fn set_aside(&self, reason: SetAsideReason, returns_at: i64) {
+        *self
+            .set_aside
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(AccountSetAside { reason, returns_at });
+        eprintln!(
+            "set aside account '{}': {} until {} (Unix seconds)",
+            self.label,
+            reason.description(),
+            returns_at
+        );
+    }
 }
 
 struct AccountCandidate {
@@ -143,12 +219,45 @@ impl AccountSelector {
     }
 
     fn select(&self) -> Result<PayingAccount> {
+        let now = unix_now()?;
+        self.select_at(now)
+    }
+
+    fn select_at(&self, now: i64) -> Result<PayingAccount> {
         for candidate in &self.accounts {
-            let usage = *candidate
+            let set_aside = *candidate
+                .account
+                .set_aside
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(set_aside) = set_aside
+                && set_aside.returns_at > now
+            {
+                eprintln!(
+                    "skipping set-aside account '{}': {}; returns at {} (Unix seconds)",
+                    candidate.account.label,
+                    set_aside.reason.description(),
+                    set_aside.returns_at
+                );
+                continue;
+            }
+            if set_aside.is_some() {
+                *candidate
+                    .account
+                    .set_aside
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+            let mut known_usage = candidate
                 .account
                 .usage
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if known_usage.is_some_and(|usage| usage.resets_at <= now) {
+                *known_usage = None;
+            }
+            let usage = *known_usage;
+            drop(known_usage);
             match usage {
                 Some(usage) if usage.used_percent >= candidate.switch_at_percent => {
                     eprintln!(
@@ -247,10 +356,7 @@ pub async fn serve(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("could not create upstream client")?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system time is before the Unix epoch")?
-        .as_secs() as i64;
+    let now = unix_now()?;
     let loaded_usage = UsageStore::load(usage_path, now);
     if let Some(warning) = loaded_usage.warning {
         eprintln!("{warning}");
@@ -282,6 +388,7 @@ pub async fn serve(
                 account_id,
                 usage: Arc::new(Mutex::new(usage)),
                 usage_store: Some(Arc::clone(&usage_store)),
+                set_aside: Arc::new(Mutex::new(None)),
             },
             priority: profile.priority,
             switch_at_percent: settings.switch_at_percent_for(profile),
@@ -370,14 +477,19 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     record_reply_usage(&paying_account, &headers);
 
     // Keep the upstream body as a stream from socket to socket.
-    let known_usage = Arc::clone(&paying_account.usage);
-    let usage_label = paying_account.label.clone();
-    let usage_store = paying_account.usage_store.clone();
+    let streaming_account = paying_account.clone();
     let mut streaming_usage = StreamingUsageReader::default();
+    let mut hard_refusal =
+        (status == StatusCode::TOO_MANY_REQUESTS).then(HardRefusalReader::default);
     let body = upstream.bytes_stream().inspect_ok(move |chunk| {
         streaming_usage.read(chunk, |usage| {
-            store_usage(&known_usage, &usage_label, usage_store.as_deref(), usage);
+            record_account_usage(&streaming_account, usage);
         });
+        if let Some(hard_refusal) = &mut hard_refusal {
+            hard_refusal.read(chunk, |returns_at| {
+                streaming_account.set_aside(SetAsideReason::OpenAiHardRefusal, returns_at);
+            });
+        }
     });
     let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
@@ -389,30 +501,34 @@ fn record_reply_usage(account: &PayingAccount, headers: &HeaderMap) {
     let Some(usage) = reply_usage(headers) else {
         return;
     };
-    store_usage(
-        &account.usage,
-        &account.label,
-        account.usage_store.as_deref(),
-        usage,
-    );
+    record_account_usage(account, usage);
 }
 
-fn store_usage(
-    known_usage: &Mutex<Option<AccountUsage>>,
-    label: &str,
-    usage_store: Option<&UsageStore>,
-    usage: AccountUsage,
-) {
-    let mut known_usage = known_usage
+fn record_account_usage(account: &PayingAccount, usage: AccountUsage) {
+    let mut known_usage = account
+        .usage
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *known_usage = Some(usage);
     drop(known_usage);
-    if let Some(usage_store) = usage_store
-        && let Err(error) = usage_store.record(label, usage)
-    {
-        eprintln!("could not save usage for account '{label}': {error}");
+    if usage.used_percent >= 100.0 {
+        account.set_aside(SetAsideReason::OutOfQuota, usage.resets_at);
     }
+    if let Some(usage_store) = &account.usage_store
+        && let Err(error) = usage_store.record(&account.label, usage)
+    {
+        eprintln!(
+            "could not save usage for account '{}': {error}",
+            account.label
+        );
+    }
+}
+
+fn unix_now() -> Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before the Unix epoch")?
+        .as_secs() as i64)
 }
 
 fn reply_usage(headers: &HeaderMap) -> Option<AccountUsage> {
