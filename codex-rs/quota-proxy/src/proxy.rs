@@ -418,16 +418,14 @@ struct ProxyState {
     account_pin: Arc<MessageAccountPin>,
 }
 
-/// Starts the transparent HTTP proxy and serves requests until it is stopped.
-pub async fn serve(
+/// Builds the shared proxy state from settings, loaded credentials, and a
+/// usage-file path. Shared by the long-running `serve()` and the ephemeral
+/// `serve_ephemeral()` used by `selfcheck`.
+fn build_state(
     settings: &PoolSettings,
     accounts: Vec<LoadedAccountCredentials>,
     usage_path: PathBuf,
-) -> Result<()> {
-    let listen_addr: SocketAddr = settings
-        .listen_addr
-        .parse()
-        .with_context(|| format!("listen_addr '{}' is invalid", settings.listen_addr))?;
+) -> Result<ProxyState> {
     let upstream_base =
         Url::parse(&settings.upstream_base).context("upstream_base URL is invalid")?;
     let client = reqwest::Client::builder()
@@ -473,13 +471,26 @@ pub async fn serve(
     if candidates.is_empty() {
         return Err(anyhow!("no usable account"));
     }
-    let state = ProxyState {
+    Ok(ProxyState {
         client,
         upstream_base,
         account_selector: Arc::new(AccountSelector::new(candidates)),
         message_boundary: Arc::new(MessageBoundaryDetector),
         account_pin: Arc::new(MessageAccountPin::default()),
-    };
+    })
+}
+
+/// Starts the transparent HTTP proxy and serves requests until it is stopped.
+pub async fn serve(
+    settings: &PoolSettings,
+    accounts: Vec<LoadedAccountCredentials>,
+    usage_path: PathBuf,
+) -> Result<()> {
+    let listen_addr: SocketAddr = settings
+        .listen_addr
+        .parse()
+        .with_context(|| format!("listen_addr '{}' is invalid", settings.listen_addr))?;
+    let state = build_state(settings, accounts, usage_path)?;
     let app = Router::new().fallback(forward).with_state(state);
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
@@ -492,6 +503,30 @@ pub async fn serve(
     axum::serve(listener, app)
         .await
         .context("proxy stopped unexpectedly")
+}
+
+/// Starts the proxy on an OS-assigned ephemeral port and returns immediately
+/// with the bound address and a handle for the background serve task, instead
+/// of blocking forever. Used by `selfcheck` to spin up a short-lived instance
+/// that never collides with a real already-running proxy and never touches a
+/// real pool's recorded usage file.
+pub(crate) async fn serve_ephemeral(
+    settings: &PoolSettings,
+    accounts: Vec<LoadedAccountCredentials>,
+    usage_path: PathBuf,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let state = build_state(settings, accounts, usage_path)?;
+    let app = Router::new().fallback(forward).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("could not bind ephemeral selfcheck listener")?;
+    let bound_addr = listener
+        .local_addr()
+        .context("could not read ephemeral listen address")?;
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Ok((bound_addr, handle))
 }
 
 fn is_usage_refresh_request(method: &Method, path: &str) -> bool {

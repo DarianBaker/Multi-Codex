@@ -116,6 +116,34 @@ pub(crate) fn pool_total_row(rows: &[AccountUsageRow]) -> AccountUsageRow {
     }
 }
 
+/// Verifies a synthesized `/api/codex/usage` response has exactly one row per
+/// configured account plus the pool-total row, each with a non-blank label.
+/// Returns the row count on success, or a human-readable description of what's
+/// wrong (used verbatim in `selfcheck`'s `USAGE READING: BROKEN (...)` line).
+pub(crate) fn verify_usage_reading(
+    body: &[u8],
+    expected_account_count: usize,
+) -> Result<usize, String> {
+    let payload: RateLimitStatusPayload = serde_json::from_slice(body)
+        .map_err(|error| format!("response is not valid JSON: {error}"))?;
+    let rows = payload
+        .additional_rate_limits
+        .flatten()
+        .ok_or_else(|| "response has no additional_rate_limits at all".to_string())?;
+
+    let expected_rows = expected_account_count + 1;
+    if rows.len() != expected_rows {
+        return Err(format!(
+            "found {} row(s), expected {expected_rows} ({expected_account_count} account(s) + 1 pool total)",
+            rows.len()
+        ));
+    }
+    if let Some(blank_index) = rows.iter().position(|row| row.limit_name.trim().is_empty()) {
+        return Err(format!("row {blank_index} has a blank label"));
+    }
+    Ok(rows.len())
+}
+
 /// Parses a real upstream `/api/codex/usage`-shaped body into the plan type and
 /// primary-window usage for that one account. Returns `None` on any parse failure
 /// or when the payload carries no primary window (both treated as "unknown usage"
@@ -180,6 +208,83 @@ mod tests {
         use crate::usage_wire::account_limit_id;
 
         assert_eq!(account_limit_id("Pool B", false), "pool:Pool B");
+    }
+
+    #[test]
+    fn verify_usage_reading_accepts_one_row_per_account_plus_total() {
+        use crate::usage_wire::pool_total_row;
+        use crate::usage_wire::verify_usage_reading;
+
+        let rows = vec![
+            AccountUsageRow {
+                label: "Pool A".to_string(),
+                limit_id: "pool:Pool A".to_string(),
+                usage: Some(usage(10.0, 1_700_000_300)),
+                is_paying: true,
+            },
+            AccountUsageRow {
+                label: "Pool B".to_string(),
+                limit_id: "pool:Pool B".to_string(),
+                usage: None,
+                is_paying: false,
+            },
+        ];
+        let total = pool_total_row(&rows);
+        let all_rows: Vec<AccountUsageRow> =
+            rows.into_iter().chain(std::iter::once(total)).collect();
+        let body =
+            synthesize_usage_response(PlanType::Plus, &all_rows[0], &all_rows, 1_700_000_000);
+
+        let count = verify_usage_reading(&body, 2).expect("two accounts plus total should verify");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn verify_usage_reading_reports_missing_rows() {
+        use crate::usage_wire::verify_usage_reading;
+
+        let rows = vec![AccountUsageRow {
+            label: "Pool A".to_string(),
+            limit_id: "pool:Pool A".to_string(),
+            usage: Some(usage(10.0, 1_700_000_300)),
+            is_paying: true,
+        }];
+        let body = synthesize_usage_response(PlanType::Plus, &rows[0], &rows, 1_700_000_000);
+
+        let error = verify_usage_reading(&body, 2)
+            .expect_err("only 1 of 2 accounts present, plus no total row");
+        assert!(
+            error.contains("1") && error.contains("3"),
+            "error should mention both the actual and expected row counts: {error}"
+        );
+    }
+
+    #[test]
+    fn verify_usage_reading_reports_a_blank_label() {
+        use crate::usage_wire::verify_usage_reading;
+
+        let rows = vec![
+            AccountUsageRow {
+                label: String::new(),
+                limit_id: "pool:blank".to_string(),
+                usage: Some(usage(10.0, 1_700_000_300)),
+                is_paying: false,
+            },
+            AccountUsageRow {
+                label: "Pool total".to_string(),
+                limit_id: "pool:total".to_string(),
+                usage: Some(usage(10.0, 1_700_000_300)),
+                is_paying: false,
+            },
+        ];
+        let body = synthesize_usage_response(PlanType::Plus, &rows[0], &rows, 1_700_000_000);
+
+        let error =
+            verify_usage_reading(&body, 1).expect_err("a blank row label should be reported");
+        assert!(
+            error.contains("blank"),
+            "error should call out the blank label: {error}"
+        );
     }
 
     #[test]

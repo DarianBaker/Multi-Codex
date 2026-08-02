@@ -4,8 +4,10 @@ use anyhow::bail;
 use codex_login::token_data::parse_jwt_expiration;
 use codex_quota_proxy::PoolSettings;
 use codex_quota_proxy::pool_status;
+use codex_quota_proxy::run_selfcheck;
 use codex_quota_proxy::serve;
 use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -25,6 +27,12 @@ async fn main() -> Result<()> {
                 anyhow::anyhow!("usage: codex-quota-proxy status <settings-file>")
             })?;
             return status(path);
+        }
+        if first == "selfcheck" {
+            let path = args.next().ok_or_else(|| {
+                anyhow::anyhow!("usage: codex-quota-proxy selfcheck <settings-file>")
+            })?;
+            return selfcheck(path).await;
         }
 
         let path = first;
@@ -115,6 +123,16 @@ async fn check(path: OsString) -> Result<()> {
         bail!("{broken} account(s) are broken");
     }
     Ok(())
+}
+
+async fn selfcheck(path: OsString) -> Result<()> {
+    let report = run_selfcheck(Path::new(&path)).await?;
+    print!("{}", report.render());
+    if report.passed() {
+        Ok(())
+    } else {
+        bail!("selfcheck found a broken component");
+    }
 }
 
 fn status(path: OsString) -> Result<()> {
