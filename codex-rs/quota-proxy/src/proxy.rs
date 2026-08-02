@@ -27,6 +27,7 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::HOST;
 use axum::http::header::SEC_WEBSOCKET_EXTENSIONS;
 use axum::response::IntoResponse;
+use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -548,6 +549,8 @@ async fn connect_upstream_websocket(
     headers: &HeaderMap,
     paying_account: &PayingAccount,
 ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    ensure_rustls_crypto_provider();
+
     let mut upstream_request = upstream_url
         .as_str()
         .into_client_request()

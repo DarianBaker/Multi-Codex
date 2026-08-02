@@ -3885,6 +3885,7 @@ dependencies = [
  "axum",
  "codex-http-client",
  "codex-login",
+ "codex-utils-rustls-provider",
  "futures",
  "pretty_assertions",
  "reqwest 0.12.28",
