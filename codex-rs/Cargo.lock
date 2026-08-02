@@ -3892,6 +3892,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "toml 0.9.11+spec-1.1.0",
 ]
 

@@ -11,7 +11,12 @@ use anyhow::anyhow;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
+use axum::extract::FromRequestParts;
 use axum::extract::State;
+use axum::extract::ws::CloseFrame as AxumCloseFrame;
+use axum::extract::ws::Message as AxumWebSocketMessage;
+use axum::extract::ws::WebSocket;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::Request;
@@ -20,10 +25,18 @@ use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::HOST;
+use axum::response::IntoResponse;
+use futures::SinkExt;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use reqwest::Url;
 use serde::Deserialize;
+use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as UpstreamWebSocketMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame as UpstreamCloseFrame;
 
 use crate::LoadedAccountCredentials;
 use crate::PoolSettings;
@@ -446,6 +459,31 @@ pub async fn serve(
 }
 
 async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+    if request
+        .headers()
+        .get("upgrade")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+    {
+        let (mut parts, body) = request.into_parts();
+        match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(websocket) => {
+                let request = Request::from_parts(parts, body);
+                return match forward_websocket(&state, websocket, request).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        eprintln!(
+                            "websocket forwarding failed; Codex can fall back to HTTP: {error}"
+                        );
+                        let mut response =
+                            Response::new(Body::from("websocket upstream unavailable"));
+                        *response.status_mut() = StatusCode::UPGRADE_REQUIRED;
+                        response
+                    }
+                };
+            }
+            Err(rejection) => return rejection.into_response(),
+        }
+    }
     match forward_request(&state, request).await {
         Ok(response) => response,
         Err(error) => {
@@ -454,6 +492,132 @@ async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Res
             *response.status_mut() = StatusCode::BAD_GATEWAY;
             response
         }
+    }
+}
+
+async fn forward_websocket(
+    state: &ProxyState,
+    websocket: WebSocketUpgrade,
+    request: Request<Body>,
+) -> Result<Response<Body>> {
+    let (parts, _) = request.into_parts();
+    let kind = state.message_boundary.classify(&parts.headers);
+    let paying_account = state
+        .account_pin
+        .account_for_request(kind, || state.account_selector.select())?;
+    eprintln!(
+        "websocket connection paid by account '{}'",
+        paying_account.label
+    );
+    let request_target = parts
+        .uri
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    let mut upstream_url = upstream_url(&state.upstream_base, request_target)?;
+    match upstream_url.scheme() {
+        "http" => upstream_url
+            .set_scheme("ws")
+            .map_err(|()| anyhow!("upstream URL cannot use WebSocket transport"))?,
+        "https" => upstream_url
+            .set_scheme("wss")
+            .map_err(|()| anyhow!("upstream URL cannot use WebSocket transport"))?,
+        "ws" | "wss" => {}
+        _ => return Err(anyhow!("upstream URL cannot use WebSocket transport")),
+    }
+    let mut upstream_request = upstream_url
+        .as_str()
+        .into_client_request()
+        .context("could not build upstream websocket request")?;
+    for (name, value) in &parts.headers {
+        upstream_request
+            .headers_mut()
+            .insert(name.clone(), value.clone());
+    }
+    upstream_request.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", paying_account.access_token))
+            .context("chosen account access token is invalid")?,
+    );
+    upstream_request.headers_mut().insert(
+        CHATGPT_ACCOUNT_ID,
+        HeaderValue::from_str(&paying_account.account_id)
+            .context("chosen account identifier is invalid")?,
+    );
+    upstream_request
+        .headers_mut()
+        .insert(HOST, upstream_host(&state.upstream_base)?);
+
+    let (upstream, _) = connect_async(upstream_request)
+        .await
+        .context("upstream websocket connection failed")?;
+    Ok(websocket
+        .on_upgrade(move |downstream| relay_websocket(downstream, upstream))
+        .into_response())
+}
+
+async fn relay_websocket(
+    downstream: WebSocket,
+    upstream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+) {
+    let (mut downstream_writer, mut downstream_reader) = downstream.split();
+    let (mut upstream_writer, mut upstream_reader) = upstream.split();
+    loop {
+        tokio::select! {
+            message = downstream_reader.next() => {
+                let Some(Ok(message)) = message else {
+                    break;
+                };
+                if upstream_writer.send(to_upstream_message(message)).await.is_err() {
+                    break;
+                }
+            }
+            message = upstream_reader.next() => {
+                let Some(Ok(message)) = message else {
+                    break;
+                };
+                let Some(message) = to_downstream_message(message) else {
+                    continue;
+                };
+                if downstream_writer.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn to_upstream_message(message: AxumWebSocketMessage) -> UpstreamWebSocketMessage {
+    match message {
+        AxumWebSocketMessage::Text(text) => UpstreamWebSocketMessage::Text(text.to_string().into()),
+        AxumWebSocketMessage::Binary(data) => UpstreamWebSocketMessage::Binary(data),
+        AxumWebSocketMessage::Ping(data) => UpstreamWebSocketMessage::Ping(data),
+        AxumWebSocketMessage::Pong(data) => UpstreamWebSocketMessage::Pong(data),
+        AxumWebSocketMessage::Close(frame) => {
+            UpstreamWebSocketMessage::Close(frame.map(|frame| UpstreamCloseFrame {
+                code: frame.code.into(),
+                reason: frame.reason.to_string().into(),
+            }))
+        }
+    }
+}
+
+fn to_downstream_message(message: UpstreamWebSocketMessage) -> Option<AxumWebSocketMessage> {
+    match message {
+        UpstreamWebSocketMessage::Text(text) => {
+            Some(AxumWebSocketMessage::Text(text.to_string().into()))
+        }
+        UpstreamWebSocketMessage::Binary(data) => Some(AxumWebSocketMessage::Binary(data)),
+        UpstreamWebSocketMessage::Ping(data) => Some(AxumWebSocketMessage::Ping(data)),
+        UpstreamWebSocketMessage::Pong(data) => Some(AxumWebSocketMessage::Pong(data)),
+        UpstreamWebSocketMessage::Close(frame) => {
+            Some(AxumWebSocketMessage::Close(frame.map(|frame| {
+                AxumCloseFrame {
+                    code: frame.code.into(),
+                    reason: frame.reason.to_string().into(),
+                }
+            })))
+        }
+        UpstreamWebSocketMessage::Frame(_) => None,
     }
 }
 
