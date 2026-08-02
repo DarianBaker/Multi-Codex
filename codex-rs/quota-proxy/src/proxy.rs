@@ -84,10 +84,10 @@ struct HardRefusalError {
     resets_at: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum MessageRequestKind {
     NewMessage,
-    FollowUp,
+    FollowUp(String),
 }
 
 #[derive(Default)]
@@ -95,10 +95,11 @@ struct MessageBoundaryDetector;
 
 impl MessageBoundaryDetector {
     fn classify(&self, headers: &HeaderMap) -> MessageRequestKind {
-        if headers.contains_key(X_CODEX_TURN_STATE) {
-            MessageRequestKind::FollowUp
-        } else {
-            MessageRequestKind::NewMessage
+        match headers.get(X_CODEX_TURN_STATE) {
+            Some(turn_state) => MessageRequestKind::FollowUp(
+                String::from_utf8_lossy(turn_state.as_bytes()).into_owned(),
+            ),
+            None => MessageRequestKind::NewMessage,
         }
     }
 }
@@ -350,29 +351,54 @@ impl AccountSelector {
 
 #[derive(Default)]
 struct MessageAccountPin {
-    pinned: Mutex<Option<PayingAccount>>,
+    pinned: Mutex<Option<PinnedAccount>>,
+}
+
+struct PinnedAccount {
+    turn_state: Option<String>,
+    account: PayingAccount,
 }
 
 impl MessageAccountPin {
     fn account_for_request(
         &self,
-        kind: MessageRequestKind,
+        kind: &MessageRequestKind,
         select: impl FnOnce() -> Result<PayingAccount>,
     ) -> Result<PayingAccount> {
         let mut pinned = self
             .pinned
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if kind == MessageRequestKind::NewMessage {
-            *pinned = None;
+        match kind {
+            MessageRequestKind::NewMessage => {
+                let account = select()?;
+                *pinned = Some(PinnedAccount {
+                    turn_state: None,
+                    account: account.clone(),
+                });
+                Ok(account)
+            }
+            MessageRequestKind::FollowUp(turn_state) => {
+                if let Some(pinned) = pinned.as_mut() {
+                    match pinned.turn_state.as_deref() {
+                        None => {
+                            pinned.turn_state = Some(turn_state.clone());
+                            return Ok(pinned.account.clone());
+                        }
+                        Some(pinned_turn_state) if pinned_turn_state == turn_state => {
+                            return Ok(pinned.account.clone());
+                        }
+                        Some(_) => {}
+                    }
+                }
+                let account = select()?;
+                *pinned = Some(PinnedAccount {
+                    turn_state: Some(turn_state.clone()),
+                    account: account.clone(),
+                });
+                Ok(account)
+            }
         }
-        if pinned.is_none() {
-            *pinned = Some(select()?);
-        }
-        pinned
-            .as_ref()
-            .cloned()
-            .context("message has no paying account")
     }
 }
 
@@ -504,14 +530,6 @@ async fn forward_websocket(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let (parts, _) = request.into_parts();
-    let kind = state.message_boundary.classify(&parts.headers);
-    let paying_account = state
-        .account_pin
-        .account_for_request(kind, || state.account_selector.select())?;
-    eprintln!(
-        "websocket connection paid by account '{}'",
-        paying_account.label
-    );
     let request_target = parts
         .uri
         .path_and_query()
@@ -527,19 +545,10 @@ async fn forward_websocket(
         "ws" | "wss" => {}
         _ => return Err(anyhow!("upstream URL cannot use WebSocket transport")),
     }
-    let upstream =
-        connect_upstream_websocket(&upstream_url, &parts.headers, &paying_account).await?;
     let relay_state = state.clone();
     Ok(websocket
         .on_upgrade(move |downstream| {
-            relay_websocket(
-                downstream,
-                upstream,
-                relay_state,
-                upstream_url,
-                parts.headers,
-                paying_account,
-            )
+            relay_websocket(downstream, relay_state, upstream_url, parts.headers)
         })
         .into_response())
 }
@@ -585,13 +594,13 @@ async fn connect_upstream_websocket(
 
 async fn relay_websocket(
     mut downstream: WebSocket,
-    mut upstream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     state: ProxyState,
     upstream_url: Url,
     headers: HeaderMap,
-    mut paying_account: PayingAccount,
 ) {
     let turn_tracker = WebsocketTurnTracker;
+    let mut upstream: Option<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> = None;
+    let mut paying_account: Option<PayingAccount> = None;
     loop {
         tokio::select! {
             message = downstream.next() => {
@@ -599,10 +608,14 @@ async fn relay_websocket(
                     break;
                 };
                 if let AxumWebSocketMessage::Text(text) = &message
-                    && turn_tracker.starts_new_turn(text)
+                    && let Some(turn_state) = turn_tracker.turn_state(text)
                 {
+                    let kind = match turn_state {
+                        Some(turn_state) => MessageRequestKind::FollowUp(turn_state),
+                        None => MessageRequestKind::NewMessage,
+                    };
                     let next_account = match state.account_pin.account_for_request(
-                        MessageRequestKind::NewMessage,
+                        &kind,
                         || state.account_selector.select(),
                     ) {
                         Ok(account) => account,
@@ -611,7 +624,11 @@ async fn relay_websocket(
                             break;
                         }
                     };
-                    if next_account.account_id != paying_account.account_id {
+                    if upstream.is_none()
+                        || paying_account
+                            .as_ref()
+                            .is_none_or(|account| account.account_id != next_account.account_id)
+                    {
                         upstream = match connect_upstream_websocket(
                             &upstream_url,
                             &headers,
@@ -619,24 +636,43 @@ async fn relay_websocket(
                         )
                         .await
                         {
-                            Ok(upstream) => upstream,
+                            Ok(upstream) => Some(upstream),
                             Err(error) => {
                                 eprintln!("could not switch websocket account: {error}");
                                 break;
                             }
                         };
                     }
-                    paying_account = next_account;
-                    eprintln!(
-                        "new websocket turn paid by account '{}'",
-                        paying_account.label
-                    );
+                    if paying_account.is_none() {
+                        eprintln!(
+                            "websocket connection paid by account '{}'",
+                            next_account.label
+                        );
+                    }
+                    if kind == MessageRequestKind::NewMessage {
+                        eprintln!(
+                            "new websocket turn paid by account '{}'",
+                            next_account.label
+                        );
+                    }
+                    paying_account = Some(next_account);
                 }
+                let Some(upstream) = upstream.as_mut() else {
+                    if matches!(message, AxumWebSocketMessage::Close(_)) {
+                        break;
+                    }
+                    continue;
+                };
                 if upstream.send(to_upstream_message(message)).await.is_err() {
                     break;
                 }
             }
-            message = upstream.next() => {
+            message = async {
+                match upstream.as_mut() {
+                    Some(upstream) => upstream.next().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 let Some(Ok(message)) = message else {
                     break;
                 };
@@ -691,11 +727,11 @@ async fn forward_request(state: &ProxyState, request: Request<Body>) -> Result<R
     let kind = state.message_boundary.classify(&parts.headers);
     match kind {
         MessageRequestKind::NewMessage => eprintln!("request starts a new message"),
-        MessageRequestKind::FollowUp => eprintln!("request continues the current message"),
+        MessageRequestKind::FollowUp(_) => eprintln!("request continues the current message"),
     }
     let paying_account = state
         .account_pin
-        .account_for_request(kind, || state.account_selector.select())?;
+        .account_for_request(&kind, || state.account_selector.select())?;
     eprintln!("request paid by account '{}'", paying_account.label);
     let request_target = parts
         .uri

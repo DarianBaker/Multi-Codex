@@ -42,8 +42,9 @@ const COMPLETED_REPLY: &str = concat!(
 );
 
 #[tokio::test]
-async fn reused_websocket_switches_account_only_for_a_new_turn() {
+async fn websocket_reconnect_keeps_same_turn_account_and_new_turn_may_switch() {
     let received = Arc::new(Mutex::new(Vec::new()));
+    let handshake_accounts = Arc::new(Mutex::new(Vec::new()));
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind websocket upstream");
@@ -51,6 +52,7 @@ async fn reused_websocket_switches_account_only_for_a_new_turn() {
         .local_addr()
         .expect("read websocket upstream address");
     let upstream_received = Arc::clone(&received);
+    let upstream_handshake_accounts = Arc::clone(&handshake_accounts);
     let upstream_task = tokio::spawn(async move {
         loop {
             let (stream, _) = upstream_listener
@@ -60,6 +62,7 @@ async fn reused_websocket_switches_account_only_for_a_new_turn() {
             let connection_account = Arc::new(Mutex::new(None));
             let handshake_account = Arc::clone(&connection_account);
             let connection_received = Arc::clone(&upstream_received);
+            let connection_handshake_accounts = Arc::clone(&upstream_handshake_accounts);
             tokio::spawn(async move {
                 let mut websocket = tokio_tungstenite::accept_hdr_async(
                     stream,
@@ -80,6 +83,10 @@ async fn reused_websocket_switches_account_only_for_a_new_turn() {
                     .expect("lock connection account")
                     .clone()
                     .expect("account header on websocket handshake");
+                connection_handshake_accounts
+                    .lock()
+                    .expect("lock websocket handshake accounts")
+                    .push(account.clone());
                 while let Some(message) = websocket.next().await {
                     let Ok(message) = message else {
                         break;
@@ -162,6 +169,12 @@ async fn reused_websocket_switches_account_only_for_a_new_turn() {
         tokio_tungstenite::connect_async(format!("ws://{proxy_addr}/responses"))
             .await
             .expect("connect through websocket proxy");
+    assert_eq!(
+        *handshake_accounts
+            .lock()
+            .expect("lock websocket handshake accounts"),
+        Vec::<String>::new()
+    );
 
     for (input_type, previous_response_id, turn_state) in [
         ("message", None, None),
@@ -170,14 +183,26 @@ async fn reused_websocket_switches_account_only_for_a_new_turn() {
             Some("response-1"),
             Some("same-turn"),
         ),
-        ("message", Some("response-2"), None),
+        (
+            "custom_tool_call_output",
+            Some("response-2"),
+            Some("same-turn"),
+        ),
+        ("message", Some("response-3"), None),
     ] {
-        if input_type == "message" && previous_response_id.is_some() {
+        if input_type == "function_call_output" {
             *first_usage.lock().expect("lock first usage") = Some(AccountUsage {
                 used_percent: 90.0,
                 window_minutes: 300,
                 resets_at: 4_102_444_800,
             });
+        }
+        if previous_response_id.is_some() {
+            websocket.close(None).await.expect("close websocket client");
+            (websocket, _) =
+                tokio_tungstenite::connect_async(format!("ws://{proxy_addr}/responses"))
+                    .await
+                    .expect("reconnect through websocket proxy");
         }
         let mut request = json!({
             "type": "response.create",
@@ -206,6 +231,10 @@ async fn reused_websocket_switches_account_only_for_a_new_turn() {
     assert_eq!(
         *received.lock().expect("lock received websocket requests"),
         vec![
+            (
+                "first-account".to_string(),
+                "unchanged-secondary-field".to_string(),
+            ),
             (
                 "first-account".to_string(),
                 "unchanged-secondary-field".to_string(),
@@ -285,9 +314,10 @@ async fn websocket_extensions_are_not_forwarded_to_the_upstream_handshake() {
     let (mut websocket, _) = tokio_tungstenite::connect_async(request)
         .await
         .expect("connect through websocket proxy");
+    let response_create = r#"{"type":"response.create","client_metadata":{},"input":[]}"#;
     websocket
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            "unchanged".into(),
+            response_create.into(),
         ))
         .await
         .expect("send downstream frame");
@@ -307,7 +337,7 @@ async fn websocket_extensions_are_not_forwarded_to_the_upstream_handshake() {
         ),
         (
             None,
-            tokio_tungstenite::tungstenite::Message::Text("unchanged".into()),
+            tokio_tungstenite::tungstenite::Message::Text(response_create.into()),
         )
     );
     websocket.close(None).await.expect("close websocket client");
@@ -855,9 +885,9 @@ fn message_with_several_tool_steps_keeps_one_boundary_for_normal_and_streaming_r
         actual,
         vec![
             (MessageRequestKind::NewMessage, false),
-            (MessageRequestKind::FollowUp, false),
-            (MessageRequestKind::FollowUp, true),
-            (MessageRequestKind::FollowUp, true),
+            (MessageRequestKind::FollowUp("same-turn".to_string()), false),
+            (MessageRequestKind::FollowUp("same-turn".to_string()), true),
+            (MessageRequestKind::FollowUp("same-turn".to_string()), true),
             (MessageRequestKind::NewMessage, true),
         ]
     );
