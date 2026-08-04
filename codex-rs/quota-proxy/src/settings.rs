@@ -170,6 +170,62 @@ impl PoolSettings {
 
         Ok(())
     }
+
+    /// Adds a new account or updates an existing one (matched by exact label),
+    /// then fully recomputes every profile's `priority` so the invariants
+    /// `PoolSettings::validate` enforces always hold, no matter what order
+    /// accounts were added or re-added in. See the design doc for why this is a
+    /// full recompute rather than an incremental patch.
+    pub fn upsert_profile(&mut self, label: &str, home: PathBuf, is_main: bool) -> Result<()> {
+        validate_label(label)?;
+
+        if let Some(existing) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.label.eq_ignore_ascii_case(label) && profile.label != label)
+        {
+            bail!(
+                "account label '{label}' collides with existing account '{}' (labels differ only by case)",
+                existing.label
+            );
+        }
+
+        if is_main {
+            for profile in &mut self.profiles {
+                profile.is_main = false;
+            }
+        }
+
+        match self.profiles.iter_mut().find(|profile| profile.label == label) {
+            Some(existing) => {
+                existing.home = home;
+                existing.is_main = is_main;
+            }
+            None => self.profiles.push(ProfileSettings {
+                label: label.to_string(),
+                home,
+                priority: 0,
+                switch_at_percent: None,
+                is_main,
+            }),
+        }
+
+        self.recompute_priorities();
+        Ok(())
+    }
+
+    fn recompute_priorities(&mut self) {
+        let non_main_count = self.profiles.iter().filter(|profile| !profile.is_main).count() as u32;
+        let mut next_non_main = 0;
+        for profile in &mut self.profiles {
+            if profile.is_main {
+                profile.priority = non_main_count;
+            } else {
+                profile.priority = next_non_main;
+                next_non_main += 1;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
