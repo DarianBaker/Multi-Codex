@@ -64,6 +64,15 @@ impl PoolSettings {
         })
     }
 
+    /// Writes these settings back to `path` as TOML, overwriting whatever is there.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let text = toml::to_string_pretty(self).context("could not serialize settings")?;
+        fs::write(path, text)
+            .with_context(|| format!("could not write settings file {}", path.display()))?;
+        Ok(())
+    }
+
     /// Uses the account override when present, otherwise the global percentage.
     pub fn switch_at_percent_for(&self, profile: &ProfileSettings) -> f64 {
         profile
