@@ -73,6 +73,28 @@ impl PoolSettings {
         Ok(())
     }
 
+    /// Creates a starter settings file at `path` if nothing exists there yet.
+    /// Leaves an existing file untouched. The written file has the explicit
+    /// empty `profile = []` array `PoolSettings::load` requires, not merely an
+    /// absent field.
+    pub fn ensure_exists(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("could not create directory {}", parent.display()))?;
+        }
+        let starter = PoolSettings {
+            listen_addr: default_listen_addr(),
+            upstream_base: default_upstream_base(),
+            default_switch_at_percent: 80.0,
+            profiles: Vec::new(),
+        };
+        starter.save(path)
+    }
+
     /// Uses the account override when present, otherwise the global percentage.
     pub fn switch_at_percent_for(&self, profile: &ProfileSettings) -> f64 {
         profile
