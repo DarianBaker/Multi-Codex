@@ -29,6 +29,36 @@ fn default_upstream_base() -> String {
     "https://chatgpt.com/backend-api/codex".to_string()
 }
 
+const RESERVED_WINDOWS_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Rejects labels that are unsafe as a directory name: empty, containing
+/// anything outside `[A-Za-z0-9_-]`, or a reserved Windows device name
+/// (checked case-insensitively so it is also rejected on non-Windows, keeping
+/// pool.toml portable between the two).
+pub fn validate_label(label: &str) -> Result<()> {
+    if label.is_empty() {
+        bail!("account label cannot be empty");
+    }
+    if !label
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!(
+            "account label '{label}' may only contain letters, digits, '_' and '-'"
+        );
+    }
+    if RESERVED_WINDOWS_DEVICE_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(label))
+    {
+        bail!("account label '{label}' is a reserved device name and cannot be used");
+    }
+    Ok(())
+}
+
 /// Settings for one account.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProfileSettings {

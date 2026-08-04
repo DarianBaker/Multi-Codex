@@ -2,6 +2,7 @@ use pretty_assertions::assert_eq;
 
 use super::PoolSettings;
 use super::ProfileSettings;
+use super::validate_label;
 
 #[test]
 fn serialize_then_deserialize_round_trips() {
@@ -76,4 +77,28 @@ fn ensure_exists_does_not_touch_an_existing_file() {
 
     let loaded = PoolSettings::load(&path).expect("load the untouched file");
     assert_eq!(loaded.default_switch_at_percent, 55.0);
+}
+
+#[test]
+fn validate_label_accepts_simple_names() {
+    assert!(validate_label("work").is_ok());
+    assert!(validate_label("account-2").is_ok());
+    assert!(validate_label("my_account").is_ok());
+}
+
+#[test]
+fn validate_label_rejects_empty_and_bad_characters() {
+    assert!(validate_label("").is_err());
+    assert!(validate_label("work/account").is_err());
+    assert!(validate_label("work account").is_err());
+    assert!(validate_label("work.account").is_err());
+}
+
+#[test]
+fn validate_label_rejects_reserved_windows_device_names_case_insensitively() {
+    assert!(validate_label("CON").is_err());
+    assert!(validate_label("con").is_err());
+    assert!(validate_label("Nul").is_err());
+    assert!(validate_label("COM1").is_err());
+    assert!(validate_label("lpt9").is_err());
 }
