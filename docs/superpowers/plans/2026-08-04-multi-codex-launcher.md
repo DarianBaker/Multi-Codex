@@ -379,6 +379,9 @@ Append to `settings_tests.rs`:
 ```rust
 use std::path::PathBuf;
 
+use super::default_listen_addr;
+use super::default_upstream_base;
+
 fn empty_pool() -> PoolSettings {
     PoolSettings {
         listen_addr: default_listen_addr(),
@@ -386,6 +389,15 @@ fn empty_pool() -> PoolSettings {
         default_switch_at_percent: 80.0,
         profiles: Vec::new(),
     }
+}
+
+/// Creates a real directory under `temp` for `label` — needed by any test
+/// that calls `PoolSettings::validate()`, since it bails if a profile's
+/// `home` doesn't exist on disk.
+fn account_dir(temp: &tempfile::TempDir, label: &str) -> PathBuf {
+    let dir = temp.path().join(label);
+    std::fs::create_dir_all(&dir).expect("create account directory");
+    dir
 }
 
 #[test]
@@ -402,10 +414,11 @@ fn upsert_adds_a_non_main_profile_at_priority_zero() {
 
 #[test]
 fn upsert_main_after_non_main_gets_the_highest_priority() {
+    let temp = tempfile::tempdir().expect("create temp dir");
     let mut pool = empty_pool();
-    pool.upsert_profile("work", PathBuf::from("/tmp/work"), false)
+    pool.upsert_profile("work", account_dir(&temp, "work"), false)
         .expect("add work");
-    pool.upsert_profile("daily", PathBuf::from("/tmp/daily"), true)
+    pool.upsert_profile("daily", account_dir(&temp, "daily"), true)
         .expect("add daily as main");
 
     let work = pool.profiles.iter().find(|p| p.label == "work").expect("work");
@@ -418,10 +431,11 @@ fn upsert_main_after_non_main_gets_the_highest_priority() {
 
 #[test]
 fn upsert_main_before_non_main_is_recomputed_so_main_stays_highest() {
+    let temp = tempfile::tempdir().expect("create temp dir");
     let mut pool = empty_pool();
-    pool.upsert_profile("daily", PathBuf::from("/tmp/daily"), true)
+    pool.upsert_profile("daily", account_dir(&temp, "daily"), true)
         .expect("add daily as main first");
-    pool.upsert_profile("work", PathBuf::from("/tmp/work"), false)
+    pool.upsert_profile("work", account_dir(&temp, "work"), false)
         .expect("add work after main already exists");
 
     let work = pool.profiles.iter().find(|p| p.label == "work").expect("work");
@@ -466,10 +480,11 @@ fn upsert_rejects_invalid_label() {
 
 #[test]
 fn upsert_new_main_demotes_the_previous_main() {
+    let temp = tempfile::tempdir().expect("create temp dir");
     let mut pool = empty_pool();
-    pool.upsert_profile("old-daily", PathBuf::from("/tmp/old"), true)
+    pool.upsert_profile("old-daily", account_dir(&temp, "old-daily"), true)
         .expect("add old-daily as main");
-    pool.upsert_profile("new-daily", PathBuf::from("/tmp/new"), true)
+    pool.upsert_profile("new-daily", account_dir(&temp, "new-daily"), true)
         .expect("add new-daily as main");
 
     let old = pool.profiles.iter().find(|p| p.label == "old-daily").expect("old-daily");
@@ -680,17 +695,26 @@ Replace the contents of `codex-rs/quota-proxy/src/bin/multi_codex.rs`:
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use codex_login::token_data::parse_jwt_expiration;
 use codex_quota_proxy::PoolSettings;
 use codex_quota_proxy::pool_status;
 use codex_quota_proxy::resolve_codex_binary;
 use codex_quota_proxy::run_selfcheck;
 use codex_quota_proxy::serve;
-use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Resolves `~/.multi-codex`. Honors `MULTI_CODEX_HOME` first so tests and
+/// manual verification runs can redirect this to a scratch directory —
+/// `dirs::home_dir()` reads platform APIs directly (`SHGetKnownFolderPath` on
+/// Windows) and does **not** consult `HOME`/`USERPROFILE`, so there is no
+/// other way to isolate a run on this platform. This mirrors
+/// `codex-utils-home-dir`'s `CODEX_HOME` override for the same reason.
 fn multi_codex_home() -> Result<PathBuf> {
+    if let Ok(override_home) = std::env::var("MULTI_CODEX_HOME") {
+        return Ok(PathBuf::from(override_home));
+    }
     let home = dirs::home_dir().context("could not find your home directory")?;
     Ok(home.join(".multi-codex"))
 }
@@ -754,23 +778,80 @@ fn accounts() -> Result<()> {
 
 async fn check() -> Result<()> {
     let pool_toml = pool_toml_path()?;
+    PoolSettings::ensure_exists(&pool_toml)?;
     let settings = PoolSettings::load(&pool_toml)?;
     settings.validate()?;
     let report = settings.load_credentials().await;
-    for account in &report.loaded {
-        println!("account '{}': {}", account.label, account.identifier);
+    let mut broken = report.errors.len();
+
+    // Mirrors `codex-quota-proxy check`'s per-account diagnostic detail
+    // (main.rs's `check`) rather than a thinner reimplementation, so users
+    // get the same specific reasons (missing tokens/email/plan, unreadable
+    // or expired JWT) regardless of which binary they run.
+    for account in report.loaded {
+        let Some(tokens) = account.credentials.tokens.as_ref() else {
+            println!(
+                "BROKEN '{}': login tokens are missing; run `multi-codex login {}`",
+                account.label, account.label
+            );
+            broken += 1;
+            continue;
+        };
+        let Some(email) = tokens.id_token.email.as_deref() else {
+            println!(
+                "BROKEN '{}': login email is missing; run `multi-codex login {}`",
+                account.label, account.label
+            );
+            broken += 1;
+            continue;
+        };
+        let Some(plan) = tokens.id_token.get_chatgpt_plan_type() else {
+            println!(
+                "BROKEN '{}': account plan is missing; run `multi-codex login {}`",
+                account.label, account.label
+            );
+            broken += 1;
+            continue;
+        };
+        let expires_at = match parse_jwt_expiration(&tokens.access_token) {
+            Ok(Some(expires_at)) => expires_at,
+            Ok(None) => {
+                println!(
+                    "BROKEN '{}': login expiry is missing; run `multi-codex login {}`",
+                    account.label, account.label
+                );
+                broken += 1;
+                continue;
+            }
+            Err(error) => {
+                println!(
+                    "BROKEN '{}': login expiry is unreadable: {error}; run `multi-codex login {}`",
+                    account.label, account.label
+                );
+                broken += 1;
+                continue;
+            }
+        };
+
+        println!(
+            "READY '{}': email={email} plan={plan} expires={}",
+            account.label,
+            expires_at.to_rfc3339()
+        );
     }
-    for error in &report.errors {
-        eprintln!("{error}");
+
+    for error in report.errors {
+        println!("BROKEN {error}");
     }
-    if !report.errors.is_empty() {
-        bail!("{} account(s) are broken", report.errors.len());
+    if broken > 0 {
+        bail!("{broken} account(s) are broken");
     }
     Ok(())
 }
 
 fn status() -> Result<()> {
     let pool_toml = pool_toml_path()?;
+    PoolSettings::ensure_exists(&pool_toml)?;
     let settings = PoolSettings::load(&pool_toml)?;
     let usage_path = usage_path_for(&pool_toml);
     let now = std::time::SystemTime::now()
@@ -787,6 +868,7 @@ fn status() -> Result<()> {
 
 async fn selfcheck() -> Result<()> {
     let pool_toml = pool_toml_path()?;
+    PoolSettings::ensure_exists(&pool_toml)?;
     let report = run_selfcheck(&pool_toml).await?;
     print!("{}", report.render());
     if report.passed() {
@@ -817,13 +899,13 @@ Expected: builds with no errors (the three `todo!()` bodies are fine — they on
 - [ ] **Step 3: Real-run verify `accounts` on a fresh machine state**
 
 ```bash
-rm -rf ~/.multi-codex-test-home  # only if this exact scratch dir exists from a prior manual run
-HOME=~/.multi-codex-test-home cargo run -p codex-quota-proxy --bin multi-codex -- accounts
+rm -rf /tmp/multi-codex-scratch  # only if this exact scratch dir exists from a prior manual run
+MULTI_CODEX_HOME=/tmp/multi-codex-scratch cargo run -p codex-quota-proxy --bin multi-codex -- accounts
 ```
 
-(On Windows, set `USERPROFILE` instead of `HOME` if `dirs::home_dir()` reads that — confirm which env var `dirs` actually reads on this platform before scripting further manual tests, since Task 12's manual verification depends on knowing this.)
+`MULTI_CODEX_HOME` is read directly by `multi_codex_home()` before falling back to `dirs::home_dir()` — use it for every manual verification run in this task and in Task 12 so real account data under the real `~/.multi-codex` is never touched by a test run.
 
-Expected: prints `no accounts configured yet; run \`multi-codex login <label>\`` and creates `~/.multi-codex-test-home/.multi-codex/pool.toml` with `default_switch_at_percent = 80.0` and `profile = []`.
+Expected: prints `no accounts configured yet; run \`multi-codex login <label>\`` and creates `/tmp/multi-codex-scratch/pool.toml` with `default_switch_at_percent = 80.0` and `profile = []`.
 
 - [ ] **Step 4: Commit**
 
@@ -992,12 +1074,13 @@ async fn launch() -> Result<()> {
 
     let listen_addr = settings.listen_addr.clone();
     let usage_path = usage_path_for(&pool_toml);
-    let settings_for_proxy = std::sync::Arc::new(settings);
-    let proxy_settings = std::sync::Arc::clone(&settings_for_proxy);
+    let loaded_accounts = credentials.loaded;
 
-    let mut serve_task = tokio::spawn(async move {
-        serve(&proxy_settings, credentials.loaded, usage_path).await
-    });
+    // `settings` moves into this future and lives exactly as long as the
+    // spawned task needs it — no `Arc` required, since nothing outside this
+    // task still needs to read it afterward.
+    let mut serve_task =
+        tokio::spawn(async move { serve(&settings, loaded_accounts, usage_path).await });
 
     tokio::select! {
         joined = &mut serve_task => {
@@ -1060,16 +1143,18 @@ git commit -m "feat(multi-codex): add default launch path (proxy + real interact
 
 **No files change in this task.** This task is the load-bearing proof the design doc requires before this can be considered done. Record what was actually observed in `codex-rs/quota-proxy/EPIC10_RESULTS.md` (new file), same evidence-file convention as `EPIC9_RESULTS.md`.
 
-- [ ] **Step 1:** Corrupted `pool.toml` fails closed. Write a syntactically-broken `~/.multi-codex/pool.toml` (or a scratch copy pointed at via a temporary `HOME`/`USERPROFILE` override) and run `multi-codex accounts`. Confirm it exits non-zero with `PoolSettings::load`'s existing line-numbered error, and does **not** silently fall back to an auto-created empty file.
-- [ ] **Step 2:** `multi-codex login <label>` happy path against a real account, using a scratch `~/.multi-codex` (temporary `HOME`/`USERPROFILE`). Confirm the OAuth/device-code flow works exactly as plain `codex login` does, and that `pool.toml` gains the expected `[[profile]]` block afterward.
-- [ ] **Step 3:** `multi-codex login` with the `codex` binary temporarily unavailable (e.g. rename it or clear PATH for the command). Confirm a clear error, not a panic or hang.
-- [ ] **Step 4:** `multi-codex login` with a cancelled/failed login (e.g. Ctrl-C the device-code prompt). Confirm a clear non-zero exit, not a panic, and that `pool.toml` is not corrupted or given a bogus entry.
-- [ ] **Step 5:** `multi-codex setup` end-to-end with two scratch accounts, one marked main. Confirm `multi-codex accounts` shows both with `daily (main)` at the highest priority.
-- [ ] **Step 6:** Default `multi-codex` launch on **this project's Windows dev machine**: confirm the proxy starts, the real interactive Codex TUI appears, a normal chat turn works, Ctrl-C/exit behaves normally, and the proxy process ends when Codex exits.
-- [ ] **Step 7:** Attempt the same default-launch verification on a Unix shell if one is available in this environment. If none is available, say so explicitly in `EPIC10_RESULTS.md` as an open caveat — do not claim Unix coverage without having actually run it.
-- [ ] **Step 8:** Port-already-in-use case: start `multi-codex` once, then start a second instance against the same `pool.toml` while the first is still running. Confirm the second exits with a clear startup error rather than hanging or silently double-serving.
+**Every step below must run with `MULTI_CODEX_HOME` set to a scratch directory** (e.g. `MULTI_CODEX_HOME=/tmp/multi-codex-scratch`, or a fresh one per step) — this is the only override `multi_codex_home()` consults (Task 8). `HOME`/`USERPROFILE` have **no effect**: `dirs::home_dir()` reads platform APIs directly (`SHGetKnownFolderPath` on Windows) and ignores both. Running any step below without `MULTI_CODEX_HOME` set operates on the real `~/.multi-codex` instead of a scratch copy — confirm it is set (e.g. `echo $MULTI_CODEX_HOME` / `$env:MULTI_CODEX_HOME` in PowerShell) before each command.
+
+- [ ] **Step 1:** Corrupted `pool.toml` fails closed. With `MULTI_CODEX_HOME` pointed at a fresh scratch directory, write a syntactically-broken `pool.toml` there and run `multi-codex accounts`. Confirm it exits non-zero with `PoolSettings::load`'s existing line-numbered error, and does **not** silently fall back to an auto-created empty file.
+- [ ] **Step 2:** `multi-codex login <label>` happy path against a real account, with `MULTI_CODEX_HOME` pointed at a fresh scratch directory. Confirm the OAuth/device-code flow works exactly as plain `codex login` does, and that `pool.toml` gains the expected `[[profile]]` block afterward.
+- [ ] **Step 3:** `multi-codex login` with the `codex` binary temporarily unavailable (e.g. rename it or clear PATH for the command), `MULTI_CODEX_HOME` still pointed at a scratch directory. Confirm a clear error, not a panic or hang.
+- [ ] **Step 4:** `multi-codex login` with a cancelled/failed login (e.g. Ctrl-C the device-code prompt), `MULTI_CODEX_HOME` still pointed at a scratch directory. Confirm a clear non-zero exit, not a panic, and that `pool.toml` is not corrupted or given a bogus entry.
+- [ ] **Step 5:** `multi-codex setup` end-to-end with two scratch accounts, one marked main, `MULTI_CODEX_HOME` pointed at a scratch directory. Confirm `multi-codex accounts` shows both with `daily (main)` at the highest priority.
+- [ ] **Step 6:** Default `multi-codex` launch on **this project's Windows dev machine**, `MULTI_CODEX_HOME` pointed at a scratch directory with at least one real logged-in account: confirm the proxy starts, the real interactive Codex TUI appears, a normal chat turn works, Ctrl-C/exit behaves normally, and the proxy process ends when Codex exits.
+- [ ] **Step 7:** Attempt the same default-launch verification on a Unix shell if one is available in this environment (there, `MULTI_CODEX_HOME` is just as required, even though `dirs::home_dir()` *would* otherwise read `$HOME` on Unix — keep the override for consistency and to avoid touching a real `~/.multi-codex` there too). If no Unix shell is available, say so explicitly in `EPIC10_RESULTS.md` as an open caveat — do not claim Unix coverage without having actually run it.
+- [ ] **Step 8:** Port-already-in-use case: start `multi-codex` once (scratch `MULTI_CODEX_HOME`), then start a second instance against the same scratch `pool.toml` while the first is still running. Confirm the second exits with a clear startup error rather than hanging or silently double-serving.
 - [ ] **Step 9:** Write up all of the above, with exact commands and observed output (redacting any tokens), in `codex-rs/quota-proxy/EPIC10_RESULTS.md`.
-- [ ] **Step 10:** `git status` — confirm only the intended files changed (settings.rs, settings_tests.rs, lib.rs, selfcheck.rs, Cargo.toml, bin/multi_codex.rs, EPIC10_RESULTS.md). Delete any scratch `~/.multi-codex-test-home`-style directories created for these manual runs; they must not be committed.
+- [ ] **Step 10:** `git status` — confirm only the intended files changed (settings.rs, settings_tests.rs, lib.rs, selfcheck.rs, Cargo.toml, bin/multi_codex.rs, EPIC10_RESULTS.md). Delete every scratch directory used as `MULTI_CODEX_HOME` for these manual runs; none must be committed.
 - [ ] **Step 11: Commit**
 
 ```bash
