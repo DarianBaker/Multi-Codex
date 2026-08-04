@@ -7,10 +7,10 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Settings shared by every account in the pool.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PoolSettings {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
@@ -30,7 +30,7 @@ fn default_upstream_base() -> String {
 }
 
 /// Settings for one account.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ProfileSettings {
     pub label: String,
     pub home: PathBuf,
@@ -110,3 +110,7 @@ impl PoolSettings {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod tests;
