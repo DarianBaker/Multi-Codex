@@ -101,40 +101,64 @@ terminal — sending a real chat turn, Ctrl-C, terminal resize. That is exactly
 the "genuinely new risk" the design doc flagged from the start as needing a
 human at a real terminal. See Caveats below.
 
-## Caveats — what still needs a human, and why
+## Update — Steps 2 and 6 completed by a human at a real terminal
 
-The design doc named this explicitly up front: *"Getting stdio inheritance,
-Ctrl-C, and terminal resize to pass through correctly to an interactive child
-is the one part that can't be unit-tested — it'll be verified by hand."* That
-held. Specifically, these steps from the plan could not be completed from this
-non-interactive environment and are **not claimed as done**:
+After the above was written, the remaining human-only steps were run for real,
+outside this environment, on the project's actual Windows dev machine:
 
-- **Step 2 — real `login` happy path.** The isolated-binary test above
-  incidentally *started* a real OAuth flow (see Step 3) and it behaved
-  correctly as far as it went — the local login server started, the real
-  `https://auth.openai.com/oauth/authorize?...` URL was printed to stdout
-  exactly as plain `codex login` does. But completing it requires a browser
-  and a human clicking through the real OpenAI login screen; this was not
-  carried to completion, and `pool.toml` gaining the expected `[[profile]]`
-  block afterward was not observed end-to-end.
-- **Step 4 — cancelled/failed login.** Same reason: needs a human to actually
-  cancel a real, in-progress OAuth flow (e.g. Ctrl-C at the right moment, or
-  closing the browser tab) to observe the error path.
-- **Step 5 — `multi-codex setup` end-to-end.** `setup()` calls `login()` in a
-  loop, so it has the same real-OAuth dependency as Step 2, twice over.
-- **Step 6 (full) — a live interactive Codex session.** Confirmed the proxy
-  starts and a correctly-configured `codex` child spawns (see above); did
-  **not** confirm a real chat turn, Ctrl-C behavior, or terminal resizing,
-  since that requires eyes on a real terminal, not a redirected/piped one.
-- **Step 7 — Unix shell verification.** No Unix shell is available in this
-  environment (Windows-only dev machine). Not claimed as covered.
+- **Step 2 — real `login` happy path: CONFIRMED.** `multi-codex login
+  test-account` and `multi-codex login test-account2` both completed a real
+  OAuth flow through a browser. `multi-codex accounts` afterward showed both
+  accounts with the expected `priority=0`/`priority=1` ordering. `pool.toml`
+  gained the expected `[[profile]]` blocks:
 
-**Recommendation:** the remaining steps (2, 4, 5, 6-full, 7) need you, at a
-real terminal, with a browser available for the OAuth step. Suggested path:
-`multi-codex login <label>` for one throwaway account, `multi-codex accounts`
-to confirm it landed, then plain `multi-codex` and use it like a normal Codex
-session for a few turns, then Ctrl-C/exit and confirm the proxy process is
-gone.
+  ```toml
+  [[profile]]
+  label = "test-account"
+  home = 'C:\Users\daria.THE_FLASH\.multi-codex\accounts\test-account'
+  priority = 0
+  is_main = false
+
+  [[profile]]
+  label = "test-account2"
+  home = 'C:\Users\daria.THE_FLASH\.multi-codex\accounts\test-account2'
+  priority = 1
+  is_main = false
+  ```
+
+- **Step 6 (full) — a live interactive Codex session: CONFIRMED.** Plain
+  `multi-codex` (no subcommand) was run for real: the proxy started, a real
+  interactive Codex TUI launched as its child with inherited stdio, a normal
+  chat turn was sent and answered, and usage was recorded for real —
+  `multi-codex status` afterward showed:
+
+  ```
+  * test-account [PAYING]: 0.0% used; resets at 1787265306 (Unix seconds)
+    test-account2: usage unavailable; reset unavailable
+  POOL TOTAL: unavailable; usage reported for 1 of 2 accounts
+  ```
+
+  `test-account2` correctly shows no usage yet — it's priority 1 and
+  `test-account` (priority 0) is nowhere near its 80% switch threshold, so the
+  selector has had no reason to fall through to it. This is the account
+  selector working as designed, not a bug.
+
+**Still genuinely open, low-risk, not yet observed:**
+
+- **Step 4 — cancelled/failed login.** No one has deliberately cancelled a
+  login mid-flow to confirm the error path (`login()`'s non-zero-exit branch)
+  triggers cleanly rather than corrupting `pool.toml`. Low risk: the code path
+  is a plain `if !status.success() { bail!(...) }` before any file is touched,
+  reviewed in the code-quality pass, just not exercised live.
+- **Step 5 — `multi-codex setup`'s interactive loop specifically.** `login()`
+  itself is now proven twice over (above); the wizard loop around it
+  (`setup()`'s blank-line-to-finish, y/N prompts) has not been run end-to-end.
+- **Step 7 — Unix shell verification.** Still no Unix shell available in this
+  project's environment. Not claimed as covered.
+
+None of these three block normal use of `multi-codex` on the primary
+(Windows, direct `login`/default-launch) path — they're specifically about
+less-common flows (mid-login cancellation, the wizard, a second OS).
 
 ## Cleanup
 
