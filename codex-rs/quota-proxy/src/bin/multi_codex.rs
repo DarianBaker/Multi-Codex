@@ -185,7 +185,39 @@ async fn selfcheck() -> Result<()> {
 }
 
 async fn login(label: &str, is_main: bool) -> Result<()> {
-    todo!("Task 9")
+    codex_quota_proxy::validate_label(label)?;
+
+    let account_home = accounts_dir()?.join(label);
+    std::fs::create_dir_all(&account_home)
+        .with_context(|| format!("could not create account directory {}", account_home.display()))?;
+
+    let codex_binary = resolve_codex_binary();
+    let status = tokio::process::Command::new(&codex_binary)
+        .env("CODEX_HOME", &account_home)
+        .arg("login")
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "could not run '{}' — is codex installed and on PATH?",
+                codex_binary.display()
+            )
+        })?;
+
+    if !status.success() {
+        bail!(
+            "`codex login` for account '{label}' did not complete successfully (exit status {status})"
+        );
+    }
+
+    let pool_toml = pool_toml_path()?;
+    PoolSettings::ensure_exists(&pool_toml)?;
+    let mut settings = PoolSettings::load(&pool_toml)?;
+    settings.upsert_profile(label, account_home, is_main)?;
+    settings.save(&pool_toml)?;
+
+    println!("account '{label}' saved to {}", pool_toml.display());
+    Ok(())
 }
 
 async fn setup() -> Result<()> {

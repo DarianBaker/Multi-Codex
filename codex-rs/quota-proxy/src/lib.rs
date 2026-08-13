@@ -15,6 +15,7 @@ pub use selfcheck::resolve_codex_binary;
 pub use selfcheck::run as run_selfcheck;
 pub use settings::PoolSettings;
 pub use settings::ProfileSettings;
+pub use settings::validate_label;
 pub use status::PoolStatus;
 pub use status::pool_status;
 
