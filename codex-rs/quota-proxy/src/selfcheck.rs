@@ -273,7 +273,7 @@ async fn probe_via_codex_exec(
 /// Looks for a `codex` binary next to this program first (the common case for
 /// a from-source build where both are produced into the same output
 /// directory), falling back to whatever `codex` resolves to on `PATH`.
-fn resolve_codex_binary() -> PathBuf {
+pub fn resolve_codex_binary() -> PathBuf {
     let exe_name = if cfg!(windows) { "codex.exe" } else { "codex" };
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(dir) = current_exe.parent()

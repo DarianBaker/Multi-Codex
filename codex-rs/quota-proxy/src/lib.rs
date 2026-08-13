@@ -11,6 +11,7 @@ pub use credentials::CredentialLoadReport;
 pub use credentials::LoadedAccountCredentials;
 pub use proxy::serve;
 pub use selfcheck::SelfcheckReport;
+pub use selfcheck::resolve_codex_binary;
 pub use selfcheck::run as run_selfcheck;
 pub use settings::PoolSettings;
 pub use settings::ProfileSettings;
