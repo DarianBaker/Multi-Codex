@@ -1,81 +1,165 @@
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+# Multi-Codex
 
----
+A fork of [Codex CLI](https://developers.openai.com/codex) with `multi-codex`
+added: a tool that pools several Codex/ChatGPT accounts behind one local
+proxy, so your usage spreads across all of them instead of draining one
+account, with automatic switch-over once an account gets close to its limit.
+Codex itself talks to the proxy exactly like it talks to the real backend —
+nothing about how you use Codex changes, only which account ends up paying
+for each request.
 
-## Quickstart
+This guide assumes you already know how to use `codex` day to day. It's about
+`multi-codex` specifically — the account-pooling layer on top.
 
-### Installing and running Codex CLI
+## Installation
 
-Run the following on Mac or Linux to install Codex CLI:
+`multi-codex` is built from this repo, not installed separately. From
+`codex-rs/`:
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+```bash
+cargo build -p codex-quota-proxy --release --bin multi-codex
 ```
 
-Run the following on Windows to install Codex CLI:
+That produces `codex-rs/target/release/multi-codex.exe` (or `multi-codex` on
+macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal:
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
+- **Windows:** System Properties → Environment Variables → add
+  `...\codex-rs\target\release` to your user `PATH`. Or, in an elevated
+  PowerShell:
+  ```powershell
+  [Environment]::SetEnvironmentVariable("PATH", $env:PATH + ";C:\path\to\codex-rs\target\release", "User")
+  ```
+- **macOS/Linux:** add to your shell profile (`.bashrc`, `.zshrc`, etc.):
+  ```bash
+  export PATH="$PATH:/path/to/codex-rs/target/release"
+  ```
+
+After that, `multi-codex` works as a bare command everywhere. Until you've
+done this, use the full path to the built binary directly.
+
+## User guide
+
+### 1. Add an account
+
+```
+multi-codex login <label>
 ```
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+Runs the real, normal `codex login` flow — opens your browser (or prints a
+URL to open yourself on a headless machine):
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
+```
+Starting local login server on http://localhost:1455.
+If your browser did not open, navigate to this URL to authenticate:
+
+https://auth.openai.com/oauth/authorize?...
+
+On a remote or headless machine? Use `codex login --device-auth` instead.
 ```
 
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
+Once you finish logging in:
+
+```
+account 'test-account' saved to C:\Users\...\.multi-codex\pool.toml
 ```
 
-Codex CLI can also be installed via the following package managers:
+Add `--main` for your regular, everyday account — used only as a last-resort
+fallback once every other account is exhausted:
 
-```shell
-# Install using npm
-npm install -g @openai/codex
+```
+multi-codex login daily --main
 ```
 
-```shell
-# Install using Homebrew
-brew install --cask codex
+Repeat for each account you want in the pool. `<label>` may only contain
+letters, digits, `_` and `-`.
+
+### 2. Or add several at once: the setup wizard
+
+```
+multi-codex setup
 ```
 
-Then simply run `codex` to get started.
+```
+Account label (blank to finish): test-account
+Is this the main fallback account? [y/N]: n
+...
+Account label (blank to finish): daily
+Is this the main fallback account? [y/N]: y
+...
+Account label (blank to finish):
+setup finished; run `multi-codex accounts` to review.
+```
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+Leave the label blank to stop. Each account goes through the same real login
+flow as step 1 — the wizard is just a loop around it.
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+### 3. Check what's configured
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+```
+multi-codex accounts
+```
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+```
+'test-account': priority=0
+'test-account2': priority=1
+```
 
-</details>
+Lower priority numbers are tried first, and `(main)` marks the fallback
+account. This is recomputed automatically every time you `login`/`setup`.
 
-### Using Codex with your ChatGPT plan
+### 4. Use it
 
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
+```
+multi-codex
+```
 
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
+No arguments. Starts the pool in the background and launches a real,
+interactive Codex session already wired up to it — use it exactly like plain
+`codex`. Exit however you normally would; the pool shuts down when Codex
+exits.
 
-## Docs
+### 5. See who's paying and how much is used
 
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
+```
+multi-codex status
+```
+
+```
+* test-account [PAYING]: 0.0% used; resets at 1787265306 (Unix seconds)
+  test-account2: usage unavailable; reset unavailable
+POOL TOTAL: unavailable; usage reported for 1 of 2 accounts
+```
+
+The `*`/`[PAYING]` marker moves as the pool switches accounts. "usage
+unavailable" just means that account hasn't handled a request yet — expected,
+not an error.
+
+### 6. After every Codex upgrade
+
+```
+multi-codex selfcheck
+```
+
+Checks redirection, account swapping, and usage reading against a throwaway
+copy of your real pool, in under a minute, and states exactly which part
+broke, if any. Codex forks change their internal request shape without
+notice; this is the fast way to catch it before you notice mid-task.
+
+## More detail
+
+- [**Full command reference**](codex-rs/quota-proxy/MULTI_CODEX.md) — every
+  subcommand (`check`, what's out of scope today, etc.) with real observed
+  output for each.
+- [**Manual setup**](codex-rs/quota-proxy/SETUP.md) — the fully hand-driven
+  path (hand-written settings file, separate proxy process, `config.toml`
+  editing), if you'd rather not use `multi-codex` itself.
+- [**Real-run proof**](codex-rs/quota-proxy/EPIC9_RESULTS.md) that the pool
+  actually bills the right account, survives a mid-conversation switch, and
+  doesn't break skills or plugins — plus
+  [proof for `multi-codex` itself](codex-rs/quota-proxy/EPIC10_RESULTS.md)
+  (real login, real interactive session, the setup wizard).
+- [**Codex CLI's own documentation**](https://developers.openai.com/codex) —
+  for everything about using `codex` day to day that isn't specific to the
+  account pool.
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).
