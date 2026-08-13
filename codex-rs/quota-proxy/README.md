@@ -17,10 +17,11 @@ Two ways to use it:
 This doc covers installation and the everyday `multi-codex` user guide. See
 [`MULTI_CODEX.md`](MULTI_CODEX.md) for the full command reference,
 [`SETUP.md`](SETUP.md) for the manual path, and
-[`EPIC9_RESULTS.md`](EPIC9_RESULTS.md) / [`EPIC10_RESULTS.md`](EPIC10_RESULTS.md)
-for real, observed proof that all of this actually works — billing the right
-account, surviving an account switch mid-conversation, not breaking skills or
-plugins, and a real login/setup/launch through `multi-codex` itself.
+[`EPIC9_RESULTS.md`](EPIC9_RESULTS.md) / [`EPIC10_RESULTS.md`](EPIC10_RESULTS.md) /
+[`EPIC11_RESULTS.md`](EPIC11_RESULTS.md) for real, observed proof that all of
+this actually works — billing the right account, surviving an account switch
+mid-conversation, not breaking skills or plugins, a real login/setup/launch
+through `multi-codex` itself, and the installer wizard.
 
 ## Installation
 
@@ -32,7 +33,19 @@ cargo build -p codex-quota-proxy --release --bin multi-codex
 ```
 
 That produces `codex-rs/target/release/multi-codex.exe` (or `multi-codex` on
-macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal:
+macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal —
+either by hand, or with the Windows installer wizard:
+
+```bash
+cargo build -p codex-quota-proxy --release --bin multi-codex --bin multi-codex-wizard
+codex-rs\target\release\multi-codex-wizard.exe
+```
+
+It copies `multi-codex.exe` to `%LOCALAPPDATA%\multi-codex\bin`, adds that
+folder to your `PATH`, and offers to run `multi-codex setup` right there.
+Safe to re-run. See `EPIC11_RESULTS.md` for what's been verified about it.
+
+By hand instead:
 
 - **Windows:** System Properties → Environment Variables → add
   `...\codex-rs\target\release` to your user `PATH`. Or, in an elevated

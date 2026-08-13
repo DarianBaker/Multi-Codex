@@ -21,7 +21,24 @@ cargo build -p codex-quota-proxy --release --bin multi-codex
 ```
 
 That produces `codex-rs/target/release/multi-codex.exe` (or `multi-codex` on
-macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal:
+macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal —
+either by hand, or with the Windows installer wizard below.
+
+### Windows: the installer wizard (recommended)
+
+```bash
+cargo build -p codex-quota-proxy --release --bin multi-codex --bin multi-codex-wizard
+codex-rs\target\release\multi-codex-wizard.exe
+```
+
+Copies `multi-codex.exe` to a stable location (`%LOCALAPPDATA%\multi-codex\bin`),
+adds that folder to your user `PATH`, and — if you say yes when it asks —
+runs `multi-codex setup` right there so you can log into your accounts in the
+same pass. Safe to re-run any time (won't duplicate the `PATH` entry). See
+[`codex-rs/quota-proxy/EPIC11_RESULTS.md`](codex-rs/quota-proxy/EPIC11_RESULTS.md)
+for exactly what's been verified about it.
+
+### By hand
 
 - **Windows:** System Properties → Environment Variables → add
   `...\codex-rs\target\release` to your user `PATH`. Or, in an elevated

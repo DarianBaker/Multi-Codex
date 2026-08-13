@@ -4,7 +4,8 @@
 to hand-write, no separate proxy process to remember to start, no editing
 `~/.codex/config.toml`. Everything below is real, observed output from
 actually running each command — see [`EPIC10_RESULTS.md`](EPIC10_RESULTS.md)
-for the full verification record.
+for the full verification record, and [`EPIC11_RESULTS.md`](EPIC11_RESULTS.md)
+for the installer wizard specifically.
 
 If `multi-codex` isn't found as a bare command, either use the full path to
 the built binary, or build a release copy and put it on `PATH` — see the
@@ -148,7 +149,20 @@ From `codex-rs/`:
 cargo build -p codex-quota-proxy --release --bin multi-codex
 ```
 
-That produces `codex-rs/target/release/multi-codex.exe`. Add that folder to
+**On Windows**, the fastest path from there is the installer wizard — builds
+alongside `multi-codex` itself, copies it to a stable location, adds that to
+your `PATH`, and can run `multi-codex setup` right there:
+
+```bash
+cargo build -p codex-quota-proxy --release --bin multi-codex --bin multi-codex-wizard
+codex-rs\target\release\multi-codex-wizard.exe
+```
+
+Safe to re-run any time. See [`EPIC11_RESULTS.md`](EPIC11_RESULTS.md) for
+exactly what's been verified about it.
+
+**By hand instead:** that first `cargo build` produces
+`codex-rs/target/release/multi-codex.exe`. Add that folder to
 your `PATH` once (System Properties → Environment Variables on Windows, or
 `export PATH="$PATH:/path/to/codex-rs/target/release"` in your shell profile
 on macOS/Linux), open a fresh terminal, and `multi-codex` works everywhere
