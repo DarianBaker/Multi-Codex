@@ -281,6 +281,9 @@ async fn launch() -> Result<()> {
                 "could not start the proxy — is another multi-codex or codex-quota-proxy already running on this port?",
             );
         }
+        // `TcpListener::bind` failing (e.g. port already in use) resolves
+        // near-instantly with no I/O wait, so this margin is a generous
+        // safety buffer against that specific failure, not a tight race.
         _ = tokio::time::sleep(Duration::from_millis(300)) => {}
     }
 
@@ -308,7 +311,24 @@ async fn launch() -> Result<()> {
         })?;
 
     let status = child.wait().await.context("could not wait for codex to exit")?;
-    serve_task.abort();
+
+    // The 300ms race above only rules out an immediate bind failure; if the
+    // proxy died later (panic, unexpected error) while codex was running,
+    // surface that now instead of the swallowed failure a plain `.abort()`
+    // would silently discard.
+    if serve_task.is_finished() {
+        match (&mut serve_task).await {
+            Ok(Err(error)) => {
+                eprintln!("warning: the proxy stopped unexpectedly before codex exited: {error:#}");
+            }
+            Err(join_error) => {
+                eprintln!("warning: the proxy task panicked before codex exited: {join_error}");
+            }
+            Ok(Ok(())) => {}
+        }
+    } else {
+        serve_task.abort();
+    }
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
