@@ -12,9 +12,12 @@ multi-codex                   # starts the pool and launches Codex, wired up
 ```
 
 That's it. `multi-codex accounts` lists what's configured; run `multi-codex`
-again any time to use the pool. Everything below this point is the manual
-setup path (hand-written settings file, separate proxy process, `config.toml`
-editing) — still supported, but `multi-codex` does all of it for you.
+again any time to use the pool. See [`MULTI_CODEX.md`](MULTI_CODEX.md) for the
+full command reference (the setup wizard, checking status, health checks,
+building it if `multi-codex` isn't found as a command yet). Everything below
+this point is the manual setup path (hand-written settings file, separate
+proxy process, `config.toml` editing) — still supported, but `multi-codex`
+does all of it for you.
 
 ## Manual setup
 

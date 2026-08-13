@@ -143,22 +143,35 @@ outside this environment, on the project's actual Windows dev machine:
   selector has had no reason to fall through to it. This is the account
   selector working as designed, not a bug.
 
+- **Step 5 — `multi-codex setup`'s interactive loop: CONFIRMED.** Two scripted
+  runs against a scratch `MULTI_CODEX_HOME`, piping input via stdin:
+  - Blank first label: prompt `Account label (blank to finish): ` appeared,
+    reading an empty line broke the loop immediately without ever calling
+    `login()`, printed `setup finished; run \`multi-codex accounts\` to
+    review.`, exit code `0`.
+  - `wizard-test` then `y`: both prompts (`Account label...` and `Is this the
+    main fallback account? [y/N]: `) appeared in order, the label and y/N
+    answer were parsed correctly, and `login("wizard-test", true)` was
+    genuinely invoked — confirmed by the real
+    `https://auth.openai.com/oauth/authorize?...` URL appearing, identical to
+    a direct `multi-codex login` call. The process was killed via `timeout`
+    before completing OAuth (same real-browser limitation as before), and
+    `setup()` propagated that as a clean `Error: \`codex login\` for account
+    'wizard-test' did not complete successfully (exit status ...)` rather than
+    panicking or leaving a half-written `pool.toml` — the scratch dir had no
+    `pool.toml` at all afterward, confirming nothing was corrupted.
+
+  This also stands in as informal confirmation of Step 4 (a login that fails
+  to complete triggers the intended clean error path), though not from a
+  user-initiated Ctrl-C specifically.
+
 **Still genuinely open, low-risk, not yet observed:**
 
-- **Step 4 — cancelled/failed login.** No one has deliberately cancelled a
-  login mid-flow to confirm the error path (`login()`'s non-zero-exit branch)
-  triggers cleanly rather than corrupting `pool.toml`. Low risk: the code path
-  is a plain `if !status.success() { bail!(...) }` before any file is touched,
-  reviewed in the code-quality pass, just not exercised live.
-- **Step 5 — `multi-codex setup`'s interactive loop specifically.** `login()`
-  itself is now proven twice over (above); the wizard loop around it
-  (`setup()`'s blank-line-to-finish, y/N prompts) has not been run end-to-end.
 - **Step 7 — Unix shell verification.** Still no Unix shell available in this
   project's environment. Not claimed as covered.
 
-None of these three block normal use of `multi-codex` on the primary
-(Windows, direct `login`/default-launch) path — they're specifically about
-less-common flows (mid-login cancellation, the wizard, a second OS).
+Every other step in this task is now confirmed for real, either from this
+environment or by the user at their own terminal.
 
 ## Cleanup
 
