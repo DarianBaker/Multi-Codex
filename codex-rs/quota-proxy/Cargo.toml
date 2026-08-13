@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "multi-codex"
 path = "src/bin/multi_codex.rs"
 
+[[bin]]
+name = "multi-codex-wizard"
+path = "src/bin/wizard.rs"
+
 [lints]
 workspace = true
 
