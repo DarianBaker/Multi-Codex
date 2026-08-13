@@ -221,7 +221,33 @@ async fn login(label: &str, is_main: bool) -> Result<()> {
 }
 
 async fn setup() -> Result<()> {
-    todo!("Task 10")
+    use std::io::BufRead;
+    use std::io::Write;
+
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    loop {
+        print!("Account label (blank to finish): ");
+        std::io::stdout().flush().ok();
+        let Some(line) = lines.next() else { break };
+        let label = line.context("could not read account label")?;
+        let label = label.trim();
+        if label.is_empty() {
+            break;
+        }
+
+        print!("Is this the main fallback account? [y/N]: ");
+        std::io::stdout().flush().ok();
+        let Some(answer) = lines.next() else { break };
+        let answer = answer.context("could not read main-account answer")?;
+        let is_main = matches!(answer.trim().to_lowercase().as_str(), "y" | "yes");
+
+        login(label, is_main).await?;
+    }
+
+    println!("setup finished; run `multi-codex accounts` to review.");
+    Ok(())
 }
 
 async fn launch() -> Result<()> {
