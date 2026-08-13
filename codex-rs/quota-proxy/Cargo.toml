@@ -8,6 +8,10 @@ license.workspace = true
 name = "codex-quota-proxy"
 path = "src/main.rs"
 
+[[bin]]
+name = "multi-codex"
+path = "src/bin/multi_codex.rs"
+
 [lints]
 workspace = true
 
@@ -18,6 +22,7 @@ codex-backend-openapi-models = { path = "../codex-backend-openapi-models" }
 codex-http-client = { workspace = true }
 codex-login = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
+dirs = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
