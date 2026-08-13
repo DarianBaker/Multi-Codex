@@ -88,6 +88,19 @@ fn ensure_exists_creates_a_starter_file_when_missing() {
 }
 
 #[test]
+fn ensure_exists_creates_missing_parent_directories() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let path = temp.path().join("nested").join("dir").join("pool.toml");
+
+    PoolSettings::ensure_exists(&path).expect("create starter pool.toml in nested dirs");
+
+    assert!(path.exists());
+    let loaded = PoolSettings::load(&path).expect("load the created starter file");
+    assert_eq!(loaded.default_switch_at_percent, 80.0);
+    assert_eq!(loaded.profiles.len(), 0);
+}
+
+#[test]
 fn ensure_exists_does_not_touch_an_existing_file() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let path = temp.path().join("pool.toml");
