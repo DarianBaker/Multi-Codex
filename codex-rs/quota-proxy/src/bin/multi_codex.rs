@@ -251,5 +251,67 @@ async fn setup() -> Result<()> {
 }
 
 async fn launch() -> Result<()> {
-    todo!("Task 11")
+    let pool_toml = pool_toml_path()?;
+    PoolSettings::ensure_exists(&pool_toml)?;
+    let settings = PoolSettings::load(&pool_toml)?;
+    settings.validate()?;
+
+    let credentials = settings.load_credentials().await;
+    for error in &credentials.errors {
+        eprintln!("{error}");
+    }
+    if credentials.loaded.is_empty() {
+        bail!("no accounts have working credentials; run `multi-codex login <label>` first");
+    }
+
+    let listen_addr = settings.listen_addr.clone();
+    let usage_path = usage_path_for(&pool_toml);
+    let loaded_accounts = credentials.loaded;
+
+    // `settings` moves into this future and lives exactly as long as the
+    // spawned task needs it — no `Arc` required, since nothing outside this
+    // task still needs to read it afterward.
+    let mut serve_task =
+        tokio::spawn(async move { serve(&settings, loaded_accounts, usage_path).await });
+
+    tokio::select! {
+        joined = &mut serve_task => {
+            let result = joined.context("proxy task panicked before it could start")?;
+            return result.context(
+                "could not start the proxy — is another multi-codex or codex-quota-proxy already running on this port?",
+            );
+        }
+        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+
+    let codex_binary = resolve_codex_binary();
+    let base_url = format!("http://{listen_addr}/backend-api/codex");
+    let mut child = tokio::process::Command::new(&codex_binary)
+        .arg("-c")
+        .arg("model_providers.multi_codex.name=\"multi_codex\"")
+        .arg("-c")
+        .arg(format!("model_providers.multi_codex.base_url=\"{base_url}\""))
+        .arg("-c")
+        .arg("model_providers.multi_codex.wire_api=\"responses\"")
+        .arg("-c")
+        .arg("model_providers.multi_codex.requires_openai_auth=true")
+        .arg("-c")
+        .arg("model_providers.multi_codex.supports_websockets=false")
+        .arg("-c")
+        .arg("model_provider=\"multi_codex\"")
+        .spawn()
+        .with_context(|| {
+            format!(
+                "could not run '{}' — is codex installed and on PATH?",
+                codex_binary.display()
+            )
+        })?;
+
+    let status = child.wait().await.context("could not wait for codex to exit")?;
+    serve_task.abort();
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
