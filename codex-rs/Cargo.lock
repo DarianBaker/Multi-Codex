@@ -3887,6 +3887,7 @@ dependencies = [
  "codex-http-client",
  "codex-login",
  "codex-utils-rustls-provider",
+ "dirs",
  "futures",
  "pretty_assertions",
  "reqwest 0.12.28",
