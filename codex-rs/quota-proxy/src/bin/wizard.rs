@@ -60,6 +60,30 @@ fn resolve_multi_codex_binary() -> Result<PathBuf> {
     }
 }
 
+/// Looks for `codex.exe` next to this wizard too. `multi-codex login`/`setup`
+/// look for a `codex.exe` sibling of wherever `multi-codex.exe` is currently
+/// running from — true today only because both land in the same
+/// `target/release/` directory, but no longer true once `multi-codex.exe` is
+/// copied to its permanent install location. Bundling `codex.exe` alongside
+/// it there keeps that lookup working, and makes the install self-contained
+/// even on a machine with no separately-installed Codex CLI. Returns `None`
+/// (not an error) if no `codex.exe` sits next to the wizard — a normal
+/// install of the official Codex CLI already puts `codex` on `PATH`, which
+/// `multi-codex` falls back to.
+fn resolve_bundled_codex_binary() -> Result<Option<PathBuf>> {
+    let current_exe =
+        std::env::current_exe().context("could not determine this program's own path")?;
+    let dir = current_exe
+        .parent()
+        .context("could not determine this program's directory")?;
+    let candidate = dir.join("codex.exe");
+    Ok(if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    })
+}
+
 /// Where `multi-codex.exe` gets installed to. `MULTI_CODEX_WIZARD_INSTALL_DIR`
 /// lets tests and manual verification redirect this to a scratch directory
 /// instead of the real per-user install location, same convention as
@@ -198,6 +222,22 @@ async fn main() -> Result<()> {
         )
     })?;
     println!("Installed multi-codex to {}", install_target.display());
+
+    match resolve_bundled_codex_binary()? {
+        Some(codex_binary) => {
+            let codex_target = install_dir.join("codex.exe");
+            std::fs::copy(&codex_binary, &codex_target).with_context(|| {
+                format!("could not copy codex to {}", codex_target.display())
+            })?;
+            println!("Also bundled codex from {}", codex_binary.display());
+        }
+        None => {
+            println!(
+                "No codex.exe found next to this wizard — assuming the official Codex CLI is \
+                 already installed and on PATH."
+            );
+        }
+    }
 
     let path_var_name =
         std::env::var("MULTI_CODEX_WIZARD_TEST_ENV_VAR").unwrap_or_else(|_| "PATH".to_string());
