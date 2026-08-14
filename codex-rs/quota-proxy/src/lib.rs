@@ -6,6 +6,7 @@ mod status;
 mod usage;
 mod usage_wire;
 mod websocket_turn;
+pub mod win_env;
 
 pub use credentials::CredentialLoadReport;
 pub use credentials::LoadedAccountCredentials;
