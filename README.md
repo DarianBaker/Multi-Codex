@@ -13,23 +13,40 @@ This guide assumes you already know how to use `codex` day to day. It's about
 
 ## Installation
 
-`multi-codex` is built from this repo, not installed separately. From
-`codex-rs/`:
+`multi-codex` is built from this repo, not installed separately — there's no
+npm package or standalone installer for it yet. Two things need to be on your
+machine first:
+
+1. **Git**, to get the source. [git-scm.com/downloads](https://git-scm.com/downloads)
+   if you don't have it (`git --version` in a terminal to check).
+2. **Rust** (which includes `cargo`, the build tool). Install via
+   [rustup.rs](https://rustup.rs) — on Windows, run:
+   ```powershell
+   winget install Rustlang.Rustup
+   ```
+   or download and run `rustup-init.exe` from that page. Close and reopen
+   your terminal afterward, then confirm with `cargo --version`.
+
+Then clone this repo and go into it:
 
 ```bash
-cargo build -p codex-quota-proxy --release --bin multi-codex
+git clone https://github.com/DarianBaker/Multi-Codex.git
+cd Multi-Codex
 ```
 
-That produces `codex-rs/target/release/multi-codex.exe` (or `multi-codex` on
-macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal —
-either by hand, or with the Windows installer wizard below.
+The actual Rust project lives in `codex-rs/` inside that folder — `cd
+codex-rs` before running any `cargo` command below.
 
 ### Windows: the installer wizard (recommended)
 
 ```bash
+cd codex-rs
 cargo build --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin multi-codex-wizard --bin codex
-codex-rs\target\release\multi-codex-wizard.exe
+target\release\multi-codex-wizard.exe
 ```
+
+The first build compiles the full `codex` CLI from source too, which takes a
+while (~20 minutes on a typical machine) — that's expected, not stuck.
 
 Building `codex` alongside the other two (not just `multi-codex`) matters:
 the wizard bundles it into the install folder too if it finds it, so the
