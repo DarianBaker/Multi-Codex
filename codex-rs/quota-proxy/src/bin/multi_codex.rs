@@ -6,7 +6,6 @@ use codex_quota_proxy::PoolSettings;
 use codex_quota_proxy::pool_status;
 use codex_quota_proxy::resolve_codex_binary;
 use codex_quota_proxy::run_selfcheck;
-use codex_quota_proxy::serve;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,6 +36,28 @@ fn usage_path_for(pool_toml: &Path) -> PathBuf {
 
 fn accounts_dir() -> Result<PathBuf> {
     Ok(multi_codex_home()?.join("accounts"))
+}
+
+/// Finds `codex-quota-proxy` next to wherever `multi-codex` is currently
+/// running from — bundled there by the installer wizard alongside
+/// `multi-codex` and `codex`, same convention as `resolve_codex_binary()`.
+/// Falls back to a bare name on `PATH` for a `cargo build` output directory,
+/// where all the binaries in this crate already land together.
+fn resolve_quota_proxy_binary() -> PathBuf {
+    let exe_name = if cfg!(windows) {
+        "codex-quota-proxy.exe"
+    } else {
+        "codex-quota-proxy"
+    };
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        let sibling = dir.join(exe_name);
+        if sibling.is_file() {
+            return sibling;
+        }
+    }
+    PathBuf::from(exe_name)
 }
 
 #[tokio::main]
@@ -263,28 +284,47 @@ async fn launch() -> Result<()> {
     if credentials.loaded.is_empty() {
         bail!("no accounts have working credentials; run `multi-codex login <label>` first");
     }
+    drop(credentials); // the proxy subprocess below loads its own
 
     let listen_addr = settings.listen_addr.clone();
-    let usage_path = usage_path_for(&pool_toml);
-    let loaded_accounts = credentials.loaded;
 
-    // `settings` moves into this future and lives exactly as long as the
-    // spawned task needs it — no `Arc` required, since nothing outside this
-    // task still needs to read it afterward.
-    let mut serve_task =
-        tokio::spawn(async move { serve(&settings, loaded_accounts, usage_path).await });
+    // The proxy runs as a genuinely separate process, not in-process: it
+    // logs a line per request (which account paid, etc.) to stdout/stderr,
+    // and this process's own stdio is about to be inherited by a real
+    // interactive Codex TUI doing raw-mode terminal rendering — any stray
+    // write from the proxy corrupts that rendering (this was found via a
+    // real run: proxy log lines bleeding into the middle of the TUI). A log
+    // file keeps the two fully separate.
+    let proxy_binary = resolve_quota_proxy_binary();
+    let log_path = multi_codex_home()?.join("proxy.log");
+    let log_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("could not create proxy log file {}", log_path.display()))?;
+    let log_file_for_stderr = log_file
+        .try_clone()
+        .context("could not clone the proxy log file handle")?;
 
-    tokio::select! {
-        joined = &mut serve_task => {
-            let result = joined.context("proxy task panicked before it could start")?;
-            return result.context(
-                "could not start the proxy — is another multi-codex or codex-quota-proxy already running on this port?",
-            );
-        }
-        // `TcpListener::bind` failing (e.g. port already in use) resolves
-        // near-instantly with no I/O wait, so this margin is a generous
-        // safety buffer against that specific failure, not a tight race.
-        _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+    let mut proxy_child = tokio::process::Command::new(&proxy_binary)
+        .arg(&pool_toml)
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file)
+        .stderr(log_file_for_stderr)
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("could not run '{}'", proxy_binary.display()))?;
+
+    // `TcpListener::bind` failing (e.g. port already in use) resolves
+    // near-instantly with no I/O wait, so this margin is a generous safety
+    // buffer against that specific failure, not a tight race.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if let Some(status) = proxy_child
+        .try_wait()
+        .context("could not check on the proxy process")?
+    {
+        bail!(
+            "could not start the proxy (exited with {status}; see {} for details) — is another \
+             multi-codex or codex-quota-proxy already running on this port?",
+            log_path.display()
+        );
     }
 
     let codex_binary = resolve_codex_binary();
@@ -314,20 +354,21 @@ async fn launch() -> Result<()> {
 
     // The 300ms race above only rules out an immediate bind failure; if the
     // proxy died later (panic, unexpected error) while codex was running,
-    // surface that now instead of the swallowed failure a plain `.abort()`
-    // would silently discard.
-    if serve_task.is_finished() {
-        match (&mut serve_task).await {
-            Ok(Err(error)) => {
-                eprintln!("warning: the proxy stopped unexpectedly before codex exited: {error:#}");
-            }
-            Err(join_error) => {
-                eprintln!("warning: the proxy task panicked before codex exited: {join_error}");
-            }
-            Ok(Ok(())) => {}
+    // surface that now instead of silently discarding it.
+    match proxy_child.try_wait() {
+        Ok(Some(proxy_status)) => {
+            eprintln!(
+                "warning: the proxy stopped unexpectedly before codex exited (exited with \
+                 {proxy_status}; see {} for details)",
+                log_path.display()
+            );
         }
-    } else {
-        serve_task.abort();
+        Ok(None) => {
+            proxy_child.start_kill().ok();
+        }
+        Err(error) => {
+            eprintln!("warning: could not check on the proxy process before exiting: {error}");
+        }
     }
 
     if !status.success() {

@@ -60,23 +60,24 @@ fn resolve_multi_codex_binary() -> Result<PathBuf> {
     }
 }
 
-/// Looks for `codex.exe` next to this wizard too. `multi-codex login`/`setup`
-/// look for a `codex.exe` sibling of wherever `multi-codex.exe` is currently
-/// running from — true today only because both land in the same
-/// `target/release/` directory, but no longer true once `multi-codex.exe` is
-/// copied to its permanent install location. Bundling `codex.exe` alongside
-/// it there keeps that lookup working, and makes the install self-contained
-/// even on a machine with no separately-installed Codex CLI. Returns `None`
-/// (not an error) if no `codex.exe` sits next to the wizard — a normal
-/// install of the official Codex CLI already puts `codex` on `PATH`, which
-/// `multi-codex` falls back to.
-fn resolve_bundled_codex_binary() -> Result<Option<PathBuf>> {
+/// Looks for another binary (`codex.exe`, `codex-quota-proxy.exe`) next to
+/// this wizard. `multi-codex login`/`setup`/the default launch all look for
+/// these as siblings of wherever `multi-codex.exe` is currently running
+/// from — true today only because everything in this crate lands in the
+/// same `target/release/` directory, but no longer true once
+/// `multi-codex.exe` is copied to its permanent install location. Bundling
+/// each one alongside it there keeps those lookups working, and makes the
+/// install self-contained even on a machine with no separately-installed
+/// Codex CLI. Returns `None` (not an error) if the named binary isn't next
+/// to the wizard — for `codex.exe` specifically, a normal Codex CLI install
+/// already puts it on `PATH`, which `multi-codex` falls back to.
+fn resolve_bundled_sibling(exe_name: &str) -> Result<Option<PathBuf>> {
     let current_exe =
         std::env::current_exe().context("could not determine this program's own path")?;
     let dir = current_exe
         .parent()
         .context("could not determine this program's directory")?;
-    let candidate = dir.join("codex.exe");
+    let candidate = dir.join(exe_name);
     Ok(if candidate.is_file() {
         Some(candidate)
     } else {
@@ -223,7 +224,7 @@ async fn main() -> Result<()> {
     })?;
     println!("Installed multi-codex to {}", install_target.display());
 
-    match resolve_bundled_codex_binary()? {
+    match resolve_bundled_sibling("codex.exe")? {
         Some(codex_binary) => {
             let codex_target = install_dir.join("codex.exe");
             std::fs::copy(&codex_binary, &codex_target).with_context(|| {
@@ -235,6 +236,24 @@ async fn main() -> Result<()> {
             println!(
                 "No codex.exe found next to this wizard — assuming the official Codex CLI is \
                  already installed and on PATH."
+            );
+        }
+    }
+
+    match resolve_bundled_sibling("codex-quota-proxy.exe")? {
+        Some(proxy_binary) => {
+            let proxy_target = install_dir.join("codex-quota-proxy.exe");
+            std::fs::copy(&proxy_binary, &proxy_target).with_context(|| {
+                format!("could not copy codex-quota-proxy to {}", proxy_target.display())
+            })?;
+            println!("Also bundled codex-quota-proxy from {}", proxy_binary.display());
+        }
+        None => {
+            println!(
+                "Warning: no codex-quota-proxy.exe found next to this wizard. Plain `multi-codex` \
+                 (with no subcommand) needs it to actually start the pool and will fail without \
+                 it — rebuild with `--bin codex-quota-proxy` included and re-run this wizard. \
+                 `login`/`setup`/`accounts`/etc. don't need it and will still work."
             );
         }
     }
