@@ -76,6 +76,46 @@ fn save_then_load_round_trips_through_a_real_file() {
 }
 
 #[test]
+fn save_does_not_leave_a_temporary_file_behind() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let path = temp.path().join("pool.toml");
+    let settings = PoolSettings {
+        listen_addr: default_listen_addr(),
+        upstream_base: default_upstream_base(),
+        default_switch_at_percent: 80.0,
+        profiles: Vec::new(),
+    };
+
+    settings.save(&path).expect("save settings");
+
+    let tmp_path = temp.path().join("pool.toml.tmp");
+    assert!(
+        !tmp_path.exists(),
+        "the temp file used for the atomic write should not remain afterward"
+    );
+    assert!(path.exists());
+}
+
+#[test]
+fn save_completely_replaces_stale_content_at_the_target_path() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let path = temp.path().join("pool.toml");
+    std::fs::write(&path, "default_switch_at_percent = 1.0\nprofile = []\n")
+        .expect("write stale existing file");
+
+    let settings = PoolSettings {
+        listen_addr: default_listen_addr(),
+        upstream_base: default_upstream_base(),
+        default_switch_at_percent: 42.0,
+        profiles: Vec::new(),
+    };
+    settings.save(&path).expect("save settings over the stale file");
+
+    let reloaded = PoolSettings::load(&path).expect("reload");
+    assert_eq!(reloaded.default_switch_at_percent, 42.0);
+}
+
+#[test]
 fn ensure_exists_creates_a_starter_file_when_missing() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let path = temp.path().join("pool.toml");

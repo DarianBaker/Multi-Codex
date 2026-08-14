@@ -94,12 +94,26 @@ impl PoolSettings {
         })
     }
 
-    /// Writes these settings back to `path` as TOML, overwriting whatever is there.
+    /// Writes these settings back to `path` as TOML, overwriting whatever is
+    /// there. Writes to a sibling `.tmp` file first and renames it into
+    /// place, so a process interrupted mid-write (crash, power loss, full
+    /// disk) never leaves a truncated `path` behind — `fs::rename` replaces
+    /// the destination atomically on both Windows and Unix. This matters
+    /// because `PoolSettings::load` deliberately fails closed on a malformed
+    /// file: a truncated write here would otherwise lock out every
+    /// previously-configured account, not just the one being added.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         let text = toml::to_string_pretty(self).context("could not serialize settings")?;
-        fs::write(path, text)
-            .with_context(|| format!("could not write settings file {}", path.display()))?;
+
+        let mut tmp_path = path.as_os_str().to_os_string();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+
+        fs::write(&tmp_path, text)
+            .with_context(|| format!("could not write temporary file {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("could not replace settings file {}", path.display()))?;
         Ok(())
     }
 
