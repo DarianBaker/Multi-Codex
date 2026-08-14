@@ -113,11 +113,17 @@ reported at least once.
 multi-codex
 ```
 
-No arguments. This starts the pool in the background and launches a real,
-normal, interactive Codex session already wired up to it — use it exactly like
-you'd use plain `codex`. Exit it the same way you always would (Ctrl-C, or
-however you normally end a session); the pool shuts down automatically when
-Codex exits.
+No arguments. This starts the pool as a separate background process and
+launches a real, normal, interactive Codex session already wired up to it —
+use it exactly like you'd use plain `codex`. Exit it the same way you always
+would (Ctrl-C, or however you normally end a session); the pool shuts down
+automatically when Codex exits.
+
+The pool runs as its own process (not sharing your terminal) specifically so
+its own logging never interferes with Codex's display — its output goes to
+`~/.multi-codex/proxy.log` instead. Check that file if something seems off
+with routing or account switching; it has the same detail
+[`SETUP.md`](SETUP.md)'s troubleshooting section describes.
 
 ## Check credentials are still valid
 
@@ -155,7 +161,7 @@ location, adds that to your `PATH`, and can run `multi-codex setup` right
 there:
 
 ```bash
-cargo build --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin multi-codex-wizard --bin codex
+cargo build --release -p codex-quota-proxy -p codex-cli --bin codex-quota-proxy --bin multi-codex --bin multi-codex-wizard --bin codex
 codex-rs\target\release\multi-codex-wizard.exe
 ```
 

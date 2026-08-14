@@ -37,7 +37,7 @@ macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal â€
 either by hand, or with the Windows installer wizard:
 
 ```bash
-cargo build --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin multi-codex-wizard --bin codex
+cargo build --release -p codex-quota-proxy -p codex-cli --bin codex-quota-proxy --bin multi-codex --bin multi-codex-wizard --bin codex
 codex-rs\target\release\multi-codex-wizard.exe
 ```
 

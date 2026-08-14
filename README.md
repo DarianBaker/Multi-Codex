@@ -41,7 +41,7 @@ codex-rs` before running any `cargo` command below.
 
 ```bash
 cd codex-rs
-cargo build --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin multi-codex-wizard --bin codex
+cargo build --release -p codex-quota-proxy -p codex-cli --bin codex-quota-proxy --bin multi-codex --bin multi-codex-wizard --bin codex
 target\release\multi-codex-wizard.exe
 ```
 
@@ -151,10 +151,11 @@ account. This is recomputed automatically every time you `login`/`setup`.
 multi-codex
 ```
 
-No arguments. Starts the pool in the background and launches a real,
-interactive Codex session already wired up to it — use it exactly like plain
-`codex`. Exit however you normally would; the pool shuts down when Codex
-exits.
+No arguments. Starts the pool as a separate background process (so its own
+logging never interferes with Codex's display — see `~/.multi-codex/proxy.log`
+if something seems off) and launches a real, interactive Codex session already
+wired up to it — use it exactly like plain `codex`. Exit however you normally
+would; the pool shuts down when Codex exits.
 
 ### 5. See who's paying and how much is used
 
