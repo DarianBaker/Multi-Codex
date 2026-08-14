@@ -9,9 +9,10 @@ to point it at a scratch directory instead of the real per-user install
 location. Every scratch value was deleted afterward and independently
 confirmed removed.
 
-Built with `cargo build -p codex-quota-proxy --release --bin multi-codex --bin
-multi-codex-wizard` — both land in `codex-rs/target/release/` together, which
-is how the wizard finds `multi-codex.exe` (looks next to its own `.exe`).
+Built with `cargo build --release -p codex-quota-proxy -p codex-cli --bin
+multi-codex --bin multi-codex-wizard --bin codex` — all three land in
+`codex-rs/target/release/` together, which is how the wizard finds
+`multi-codex.exe` and `codex.exe` (looks next to its own `.exe`).
 
 ## What was proven
 
@@ -80,11 +81,48 @@ that specific error, check `multi-codex` on `PATH` before assuming nothing
 happened. Not fixed here since it's a defensive-but-occasionally-overcautious
 error report, not a correctness bug — flagging it rather than hiding it.
 
+## Update — a real run against your real PATH, and the `codex.exe` gap it found
+
+You ran the wizard for real (no overrides) shortly after the above was
+written. It worked exactly as designed: found `multi-codex.exe`, installed it
+to the real `%LOCALAPPDATA%\multi-codex\bin`, added that to your real user
+`PATH`. You then said yes to adding an account, and it correctly handed off to
+`multi-codex.exe setup` — which failed with `Error: could not run 'codex.exe'
+— is codex installed and on PATH?`.
+
+That wasn't a wizard bug: `multi-codex login`/`setup` look for `codex.exe`
+next to wherever `multi-codex.exe` is currently running from, which worked
+fine in `target/release/` (this repo builds `codex` and `multi-codex`
+side by side there) but stopped being true the moment the wizard copied
+`multi-codex.exe` to its permanent install folder — a folder with no
+`codex.exe` in it. This machine also had no separately-installed, on-`PATH`
+Codex CLI to fall back to (`codex-rs/target/release/codex.exe` had never been
+built; only a stale `target/debug/codex.exe` existed).
+
+**Fix:** the wizard now also looks for `codex.exe` next to itself and, if
+found, copies it into the install folder alongside `multi-codex.exe` — so the
+sibling lookup keeps working after install, and the result is self-contained
+even on a machine with no separate Codex CLI install at all.
+
+**Verified, real binaries, scratch install dir + scratch registry variable
+(never the real `PATH`):**
+- With `codex.exe` present next to the wizard (built via `cargo build
+  --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin
+  multi-codex-wizard --bin codex`): output included `Also bundled codex from
+  ...\target\release\codex.exe`, and both `codex.exe` and `multi-codex.exe`
+  were confirmed present in the scratch install directory afterward, correct
+  file sizes.
+- With no `codex.exe` next to the wizard (isolated directory, only
+  `multi-codex-wizard.exe` + `multi-codex.exe`): output included `No codex.exe
+  found next to this wizard — assuming the official Codex CLI is already
+  installed and on PATH.` — no error, no crash, install proceeds normally for
+  people who already have Codex CLI installed separately.
+
 ## What still needs you
 
-Nothing was run against your real `PATH` or real `%LOCALAPPDATA%\multi-codex`
-tonight — that's deliberate. All of the above proves the underlying mechanism
-is correct using scratch/throwaway state; actually running the real wizard
-(`multi-codex-wizard.exe`, no overrides set) against your real environment is
-the one thing left, so you can watch it happen and confirm the result
-yourself before it's anything other than reviewable.
+The bundling fix itself hasn't been run against your *real* `PATH`/install
+folder yet — only against scratch state, deliberately, same reasoning as
+before. Re-running the real wizard (no overrides) will pick up the fix; on a
+completely clean machine with no prior Codex install at all, `multi-codex
+setup` should now work without you needing to install Codex CLI separately
+first.

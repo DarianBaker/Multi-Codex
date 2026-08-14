@@ -27,14 +27,18 @@ either by hand, or with the Windows installer wizard below.
 ### Windows: the installer wizard (recommended)
 
 ```bash
-cargo build -p codex-quota-proxy --release --bin multi-codex --bin multi-codex-wizard
+cargo build --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin multi-codex-wizard --bin codex
 codex-rs\target\release\multi-codex-wizard.exe
 ```
 
-Copies `multi-codex.exe` to a stable location (`%LOCALAPPDATA%\multi-codex\bin`),
-adds that folder to your user `PATH`, and — if you say yes when it asks —
-runs `multi-codex setup` right there so you can log into your accounts in the
-same pass. Safe to re-run any time (won't duplicate the `PATH` entry). See
+Building `codex` alongside the other two (not just `multi-codex`) matters:
+the wizard bundles it into the install folder too if it finds it, so the
+result works even on a machine with **no separately-installed Codex CLI at
+all** — nothing extra to install first. Copies everything to a stable
+location (`%LOCALAPPDATA%\multi-codex\bin`), adds that folder to your user
+`PATH`, and — if you say yes when it asks — runs `multi-codex setup` right
+there so you can log into your accounts in the same pass. Safe to re-run any
+time (won't duplicate the `PATH` entry). See
 [`codex-rs/quota-proxy/EPIC11_RESULTS.md`](codex-rs/quota-proxy/EPIC11_RESULTS.md)
 for exactly what's been verified about it.
 

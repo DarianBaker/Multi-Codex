@@ -37,11 +37,13 @@ macOS/Linux). Add that folder to your `PATH` once, then open a fresh terminal â€
 either by hand, or with the Windows installer wizard:
 
 ```bash
-cargo build -p codex-quota-proxy --release --bin multi-codex --bin multi-codex-wizard
+cargo build --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin multi-codex-wizard --bin codex
 codex-rs\target\release\multi-codex-wizard.exe
 ```
 
-It copies `multi-codex.exe` to `%LOCALAPPDATA%\multi-codex\bin`, adds that
+Building `codex` too (not just `multi-codex`) lets the wizard bundle it into
+the install folder, so the result works even with no Codex CLI installed
+separately. Copies everything to `%LOCALAPPDATA%\multi-codex\bin`, adds that
 folder to your `PATH`, and offers to run `multi-codex setup` right there.
 Safe to re-run. See `EPIC11_RESULTS.md` for what's been verified about it.
 

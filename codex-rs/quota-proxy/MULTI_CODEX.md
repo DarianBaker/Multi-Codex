@@ -150,16 +150,20 @@ cargo build -p codex-quota-proxy --release --bin multi-codex
 ```
 
 **On Windows**, the fastest path from there is the installer wizard — builds
-alongside `multi-codex` itself, copies it to a stable location, adds that to
-your `PATH`, and can run `multi-codex setup` right there:
+alongside `multi-codex` and `codex` themselves, copies both to a stable
+location, adds that to your `PATH`, and can run `multi-codex setup` right
+there:
 
 ```bash
-cargo build -p codex-quota-proxy --release --bin multi-codex --bin multi-codex-wizard
+cargo build --release -p codex-quota-proxy -p codex-cli --bin multi-codex --bin multi-codex-wizard --bin codex
 codex-rs\target\release\multi-codex-wizard.exe
 ```
 
-Safe to re-run any time. See [`EPIC11_RESULTS.md`](EPIC11_RESULTS.md) for
-exactly what's been verified about it.
+Building `codex` too (not just `multi-codex`) is what makes the result work
+even on a machine with no Codex CLI installed separately — the wizard bundles
+it alongside `multi-codex.exe` automatically. Safe to re-run any time. See
+[`EPIC11_RESULTS.md`](EPIC11_RESULTS.md) for exactly what's been verified
+about it.
 
 **By hand instead:** that first `cargo build` produces
 `codex-rs/target/release/multi-codex.exe`. Add that folder to
